@@ -1,0 +1,5361 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>汉字冒险</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: #fff;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+canvas {
+  display: block;
+  margin: 0 auto;
+  background: #fff;
+}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// =============================================================
+// SECTION 1: CONSTANTS AND CONFIGURATION
+// =============================================================
+const TILE = 32;
+const FONT_FAMILY = '"PingFang SC","Microsoft YaHei","Noto Sans SC","Hiragino Sans GB",sans-serif';
+const GRAVITY = 900;
+const MAX_FALL = 600;
+const PLAYER_SPEED = 160;
+const PLAYER_JUMP = -380;
+const FRICTION = 0.82;
+const DASH_SPEED = 400;
+const DASH_DURATION = 0.25;
+const DASH_COOLDOWN = 0.5;
+const DOUBLE_TAP_WINDOW = 0.25;
+const PLUNGE_HOLD_THRESHOLD = 0.2;
+const PLUNGE_SPEED = 500;
+const DASH_ATK_RANGE_MULT = 1.6;
+const DASH_ATK_DMG_MULT = 1.8;
+const CN = ['零','一','二','三','四','五','六','七','八','九','十'];
+function cnNum(n){ if(n<=10) return CN[n]; if(n<20) return '十'+(n%10?CN[n%10]:''); return CN[Math.floor(n/10)]+'十'+(n%10?CN[n%10]:''); }
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 400, H = 600, DPR = 1, SCALE = 1;
+let GAME_W = 400, GAME_H = 600;
+let WORLD_SCALE = 1;
+
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  let vw = window.innerWidth, vh = window.innerHeight;
+  W = vw; H = vh;
+  W = Math.floor(W); H = Math.floor(H);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  GAME_W = W; GAME_H = H;
+  SCALE = Math.min(W / 400, H / 600);
+  if (SCALE < 0.6) SCALE = 0.6;
+  const isPortrait = H > W * 1.1;
+  if (isPortrait) {
+    WORLD_SCALE = W / (10 * TILE);
+  } else {
+    WORLD_SCALE = (H * 0.85) / (14 * TILE);
+  }
+  if (WORLD_SCALE < 0.8) WORLD_SCALE = 0.8;
+  if (WORLD_SCALE > 2) WORLD_SCALE = 2;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// =============================================================
+// SECTION 2: CHARACTER ATLAS CACHE
+// =============================================================
+const atlas = { cache: new Map(), _order: [] };
+atlas.key = (c,s,col) => c+'|'+s+'|'+col;
+atlas.pre = function(c,s,col) {
+  const k = this.key(c,s,col);
+  if (this.cache.has(k)) return;
+  // Evict oldest entries if cache is too large
+  if (this.cache.size > 400) {
+    const toRemove = this._order.splice(0, 100);
+    for (const rk of toRemove) this.cache.delete(rk);
+  }
+  const cv = document.createElement('canvas');
+  const cx = cv.getContext('2d');
+  cx.font = 'bold '+s+'px '+FONT_FAMILY;
+  const m = cx.measureText(c);
+  cv.width = Math.ceil(m.width)+6;
+  cv.height = Math.ceil(s*1.4)+6;
+  cx.font = 'bold '+s+'px '+FONT_FAMILY;
+  cx.fillStyle = col;
+  cx.textBaseline = 'top';
+  cx.fillText(c, 3, 3);
+  this.cache.set(k, { cv, w: cv.width, h: cv.height });
+  this._order.push(k);
+};
+atlas.draw = function(ctx, c, s, col, x, y, alpha) {
+  s = Math.round(s);
+  const k = this.key(c,s,col);
+  let e = this.cache.get(k);
+  if (!e) { this.pre(c,s,col); e = this.cache.get(k); }
+  if (!e || !e.cv) return e;
+  if (alpha !== undefined && alpha < 1) { ctx.globalAlpha = alpha; }
+  ctx.drawImage(e.cv, (x|0)-3, (y|0)-3);
+  if (alpha !== undefined && alpha < 1) { ctx.globalAlpha = 1; }
+  return e;
+};
+atlas.measure = function(c,s,col) {
+  const k = this.key(c,s,col||'#000');
+  let e = this.cache.get(k);
+  if (!e) { this.pre(c,s,col||'#000'); e = this.cache.get(k); }
+  return { w: e.w-6, h: e.h-6 };
+};
+
+// Prerender common characters
+const PRERENDER_CHARS = [
+  ['墙',20,'#78909C'],['土',20,'#8D6E63'],['岩',20,'#757575'],
+  ['砖',20,'#A1887F'],['水',20,'#29B6F6'],['门',22,'#5D4037'],
+  ['梯',20,'#A1887F'],['箱',20,'#FFC107'],['刺',20,'#9E9E9E'],
+  ['碑',20,'#607D8B'],['树',22,'#795548'],['叶',16,'#4CAF50'],
+  ['果',14,'#FF9800'],['灯',16,'#FFD600'],['柱',20,'#9E9E9E'],
+  ['云',18,'#B0BEC5'],['草',16,'#66BB6A'],['桥',20,'#8D6E63'],['窗',20,'#81D4FA'],
+  ['骨',20,'#E0E0E0'],['灰',20,'#9E9E9E'],
+  ['？',20,'#999'],['返',16,'#666'],['回',16,'#666'],
+  ['开',16,'#333'],['始',16,'#333'],['游',16,'#333'],['戏',16,'#333'],
+  ['操',16,'#333'],['作',16,'#333'],['说',16,'#333'],['明',16,'#333'],
+  ['成',16,'#333'],['就',16,'#333'],['击',14,'#999'],['杀',14,'#999'],
+  ['头',22,'#5D4037'],['身',20,'#1565C0'],['体',20,'#1565C0'],['手',16,'#FFAB91'],
+  ['腿',16,'#37474F'],['脚',14,'#795548'],['甲',20,'#FFD600'],
+  ['鞋',14,'#E91E63'],['剑',18,'#B0BEC5'],['盔',18,'#FF8F00'],
+  ['枪',18,'#607D8B'],['长',16,'#9E9E9E'],['火',18,'#FF5722'],
+  ['毒',18,'#4CAF50'],['魔',28,'#9C27B0'],['野',24,'#795548'],
+  ['猪',24,'#795548'],['蛛',22,'#4CAF50'],['蝠',18,'#616161'],
+  ['骷',22,'#ECEFF1'],['髅',22,'#ECEFF1'],['影',24,'#444'],
+  ['鬼',28,'#3F51B5'],['将',28,'#3F51B5'],['龙',36,'#FF1744'],
+  ['王',36,'#D50000'],['法',24,'#FF5722'],['师',24,'#FF5722'],
+  ['血',16,'#F44336'],['生',14,'#333'],['命',14,'#333'],
+  ['攻',14,'#333'],['防',14,'#333'],['速',14,'#333'],
+  ['痛',16,'#F44336'],['斩',18,'#FFD600'],['燃',14,'#FF5722'],
+  ['晕',14,'#9C27B0'],['愈',16,'#4CAF50'],['震',20,'#9E9E9E'],
+  ['开',20,'#4CAF50'],['钥',18,'#FDD835'],
+  ['肉',18,'#D32F2F'],['丹',18,'#E040FB'],['光',12,'#FFD600'],
+  ['骨',18,'#ECEFF1'],['球',16,'#FF5722'],['矢',14,'#8D6E63'],
+  ['毒',14,'#4CAF50'],['冰',18,'#B3E5FC'],['暗',20,'#212121'],['冲',20,'#607D8B'],
+  ['左',20,'#666'],['右',20,'#666'],['跳',20,'#666'],['攻',20,'#666'],
+  ['泥',20,'#8B7355'],['弹',20,'#FF6F00'],['风',20,'#90CAF9'],
+  ['雾',20,'#B0BEC5'],['藤',20,'#2E7D32'],['沼',20,'#558B2F'],
+  ['碎',14,'#A1887F'],['闪',16,'#3F51B5'],['坠',18,'#FF8F00'],
+  ['蛇',18,'#33691E'],['妖',20,'#2E7D32'],['灵',16,'#B3E5FC'],
+  ['客',18,'#37474F'],['忍',20,'#37474F'],['炎',24,'#FF6D00'],
+  ['雷',24,'#FDD835'],['兽',28,'#FDD835'],['电',14,'#FFD600'],
+  ['熔',24,'#FF6D00'],['岩',28,'#BF360C'],['焰',14,'#FF3D00'],
+  ['冥',24,'#7B1FA2'],['蟒',28,'#4A148C'],['息',14,'#CE93D8'],
+  ['古',24,'#5D4037'],['傀',24,'#4E342E'],['儡',24,'#3E2723'],['盾',20,'#8D6E63'],
+  ['翼',20,'#B71C1C'],['爪',18,'#D32F2F'],['尾',18,'#C62828'],['角',16,'#FF6F00'],
+  ['鳞',14,'#B71C1C'],['吼',16,'#FF3D00'],['啸',14,'#FF6D00'],['噬',16,'#D50000'],
+];
+PRERENDER_CHARS.forEach(([c,s,col]) => atlas.pre(c,s,col));
+
+// =============================================================
+// SECTION 3: INPUT SYSTEM
+// =============================================================
+const input = { left:false, right:false, jump:false, attack:false, interact:false, jumpPressed:false, attackPressed:false, jumpBuffer:0 };
+const keys = {};
+let godMode = false;
+let godBuf = '';
+let godLevelInput = '';
+document.addEventListener('keydown', e => {
+  keys[e.key]=true;
+  e.preventDefault();
+  // God mode activation: type "god" consecutively
+  godBuf += e.key.toLowerCase();
+  if (godBuf.length > 10) godBuf = godBuf.slice(-10);
+  if (godBuf.endsWith('god')) {
+    godMode = !godMode;
+    godBuf = '';
+    godLevelInput = '';
+  }
+  // God mode: type number then press Enter to switch level
+  if (godMode && e.key >= '0' && e.key <= '9') {
+    godLevelInput += e.key;
+  }
+  if (godMode && e.key === 'Enter' && godLevelInput.length > 0) {
+    const lvIdx = parseInt(godLevelInput, 10);
+    godLevelInput = '';
+    if (lvIdx >= 0 && lvIdx < LEVELS.length) {
+      startLevel(lvIdx);
+    }
+  }
+  if (godMode && e.key === 'Backspace') {
+    godLevelInput = godLevelInput.slice(0, -1);
+  }
+  if (godMode && e.key === 'Escape') {
+    godLevelInput = '';
+  }
+  // Menu keyboard navigation
+  if (scene === 'title') {
+    const k = e.key;
+    if (menuState === 'main') {
+      if (k==='ArrowUp'||k==='w'||k==='W') { menuSel = (menuSel+2)%3; }
+      else if (k==='ArrowDown'||k==='s'||k==='S') { menuSel = (menuSel+1)%2; }
+      else if (k==='Enter'||k===' '||k==='z'||k==='Z'||k==='j'||k==='J') {
+        if (menuSel===0) { resetPlayer(); storyChars.length=0; startLevel(0); }
+        else if (menuSel===1) { menuState='controls'; menuSel=0; }
+      }
+    } else if (menuState === 'controls') {
+      if (k==='Escape'||k==='Enter'||k===' '||k==='z'||k==='Z'||k==='j'||k==='J') {
+        menuState='main'; menuSel=1;
+      }
+    }
+  }
+  // Death screen keyboard navigation
+  if (scene === 'death') {
+    const k = e.key;
+    if (k==='ArrowUp'||k==='w'||k==='W') { deathMenuSel = 0; }
+    else if (k==='ArrowDown'||k==='s'||k==='S') { deathMenuSel = 1; }
+    else if (k==='Enter'||k===' '||k==='z'||k==='Z'||k==='j'||k==='J') { handleMenuAction(); }
+  }
+  // Victory screen keyboard
+  if (scene === 'victory') {
+    const k = e.key;
+    if (k==='Enter'||k===' '||k==='z'||k==='Z'||k==='j'||k==='J') { handleMenuAction(); }
+  }
+});
+document.addEventListener('keyup', e => { keys[e.key]=false; });
+function updateKeyboardInput() {
+  input.left = !!(keys['ArrowLeft']||keys['a']||keys['A']);
+  input.right = !!(keys['ArrowRight']||keys['d']||keys['D']);
+  let jmp = !!(keys['ArrowUp']||keys['w']||keys['W']||keys[' ']);
+  input.jumpPressed = jmp && !input.jump;
+  input.jump = jmp;
+  let atk = !!(keys['z']||keys['Z']||keys['j']||keys['J']);
+  input.attackPressed = atk && !input.attack;
+  input.attack = atk;
+  input.interact = !!(keys['e']||keys['E']);
+}
+
+// Touch controls
+const touchState = { left:false, right:false, jump:false, attack:false };
+const touchIds = new Map();
+const touchBtns = [
+  { id:'left',  rx:0,    ry:0.82, rw:0.2, rh:0.18, label:'左', col:'#999' },
+  { id:'right', rx:0.2,  ry:0.82, rw:0.2, rh:0.18, label:'右', col:'#999' },
+  { id:'jump',  rx:0.6,  ry:0.82, rw:0.2, rh:0.18, label:'跳', col:'#4CAF50' },
+  { id:'attack',rx:0.8,  ry:0.82, rw:0.2, rh:0.18, label:'攻', col:'#F44336' },
+];
+function getTouchBtn(tx,ty) {
+  for (const b of touchBtns) {
+    if (tx >= b.rx*W && tx < (b.rx+b.rw)*W && ty >= b.ry*H && ty < (b.ry+b.rh)*H) return b.id;
+  }
+  return null;
+}
+// Mobile god mode: sequence left,left,right,right,jump,jump,attack,attack
+const GOD_SEQ = ['left','left','right','right','jump','jump','attack','attack'];
+const touchGodBuf = [];
+let godMobileLevelSel = 0;
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const bid = getTouchBtn(t.clientX - canvas.getBoundingClientRect().left, t.clientY - canvas.getBoundingClientRect().top);
+    if (bid) {
+      touchIds.set(t.identifier, bid);
+      // God mode level selection on mobile — consume input, don't pass to game
+      if (godMode && ('ontouchstart' in window)) {
+        if (bid === 'left')  godMobileLevelSel = Math.max(0, godMobileLevelSel - 1);
+        if (bid === 'right') godMobileLevelSel = Math.min(LEVELS.length - 1, godMobileLevelSel + 1);
+        if (bid === 'jump')  { startLevel(godMobileLevelSel); }
+        if (bid === 'attack'){ godMode = false; }
+        touchGodBuf.length = 0;
+      } else {
+        touchState[bid] = true;
+        // Track sequence for god mode activation
+        touchGodBuf.push(bid);
+        if (touchGodBuf.length > GOD_SEQ.length) touchGodBuf.shift();
+        if (touchGodBuf.length === GOD_SEQ.length && touchGodBuf.every((v,i) => v === GOD_SEQ[i])) {
+          godMode = true;
+          godMobileLevelSel = currentLevel || 0;
+          touchGodBuf.length = 0;
+        }
+      }
+    }
+  }
+}, {passive:false});
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  for (const b of touchBtns) touchState[b.id] = false;
+  for (const t of e.touches) {
+    const bid = getTouchBtn(t.clientX - canvas.getBoundingClientRect().left, t.clientY - canvas.getBoundingClientRect().top);
+    if (bid) { touchIds.set(t.identifier, bid); touchState[bid] = true; }
+  }
+}, {passive:false});
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const bid = touchIds.get(t.identifier);
+    if (bid) { touchState[bid] = false; touchIds.delete(t.identifier); }
+  }
+}, {passive:false});
+canvas.addEventListener('touchcancel', e => {
+  for (const t of e.changedTouches) {
+    const bid = touchIds.get(t.identifier);
+    if (bid) { touchState[bid] = false; touchIds.delete(t.identifier); }
+  }
+}, {passive:false});
+function updateTouchInput() {
+  if (touchState.left) input.left = true;
+  if (touchState.right) input.right = true;
+  if (touchState.jump) { if (!input.jump) input.jumpPressed = true; input.jump = true; }
+  if (touchState.attack) { if (!input.attack) input.attackPressed = true; input.attack = true; }
+}
+
+// =============================================================
+// SECTION 4: CAMERA
+// =============================================================
+const cam = { x:0, y:0, shakeX:0, shakeY:0, shakeT:0, shakeI:0 };
+cam.follow = function(tx,ty,lw,lh,dt) {
+  const vw = GAME_W / WORLD_SCALE;
+  const vh = GAME_H / WORLD_SCALE;
+  const isMobile = ('ontouchstart' in window);
+  const playableH = isMobile ? vh * 0.82 : vh;
+  const mobileShift = isMobile ? TILE / 2 : 0;
+  const targetX = tx - vw/2;
+  const targetY = ty - playableH * 0.45;
+  this.x += (targetX - this.x) * Math.min(1, 6*dt);
+  this.y += (targetY - this.y) * Math.min(1, 6*dt);
+  this.x = Math.max(0, Math.min(this.x, Math.max(0, lw - vw)));
+  if (lh <= playableH) {
+    this.y = -(playableH - lh) / 2 - mobileShift;
+  } else {
+    const maxY = lh - playableH;
+    this.y = Math.max(0 - mobileShift, Math.min(this.y, maxY));
+  }
+};
+cam.shake = function(i,d) { this.shakeT=d; this.shakeI=i; };
+cam.update = function(dt) {
+  if (this.shakeT>0) { this.shakeT-=dt; this.shakeX=(Math.random()-0.5)*this.shakeI; this.shakeY=(Math.random()-0.5)*this.shakeI; }
+  else { this.shakeX=0; this.shakeY=0; }
+};
+// Instant snap camera to player (no smooth pan)
+cam.snap = function(px, py, lw, lh) {
+  const vw = GAME_W / WORLD_SCALE;
+  const vh = GAME_H / WORLD_SCALE;
+  const isMobile = ('ontouchstart' in window);
+  const playableH = isMobile ? vh * 0.82 : vh;
+  const mobileShift = isMobile ? TILE / 2 : 0;
+  this.x = px - vw/2;
+  this.y = py - playableH * 0.45;
+  this.x = Math.max(0, Math.min(this.x, Math.max(0, lw - vw)));
+  if (lh <= playableH) {
+    this.y = -(playableH - lh) / 2 - mobileShift;
+  } else {
+    this.y = Math.max(0 - mobileShift, Math.min(this.y, lh - playableH));
+  }
+  this.shakeX = 0; this.shakeY = 0; this.shakeT = 0;
+};
+
+// =============================================================
+// SECTION 5: PARTICLE SYSTEM
+// =============================================================
+const particles = [];
+const _pendingParticles = [];
+let _renderPhase = false;
+function addParticle(c,x,y,vx,vy,col,sz,life,grav) {
+  const p = {c,x,y,vx,vy,col,sz,life,maxLife:life,grav:grav||0};
+  if (_renderPhase) { _pendingParticles.push(p); return; }
+  if (particles.length > 300) particles.splice(0, 50);
+  particles.push(p);
+}
+function flushPendingParticles() {
+  for (let i=0;i<_pendingParticles.length;i++) {
+    if (particles.length > 300) particles.splice(0, 50);
+    particles.push(_pendingParticles[i]);
+  }
+  _pendingParticles.length = 0;
+}
+function updateParticles(dt) {
+  let writeIdx = 0;
+  for (let i=0;i<particles.length;i++) {
+    const p=particles[i];
+    p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy+=p.grav*dt;
+    p.life-=dt;
+    if (p.life>0) {
+      particles[writeIdx++]=p;
+    }
+  }
+  particles.length = writeIdx;
+}
+function renderParticles(ctx) {
+  for (const p of particles) {
+    const a = Math.max(0, p.life/p.maxLife);
+    const s = Math.max(4, Math.round(p.sz * a));
+    atlas.draw(ctx, p.c, s, p.col, p.x - cam.x + cam.shakeX, p.y - cam.y + cam.shakeY, a);
+  }
+}
+
+// =============================================================
+// SECTION 6: TILE AND WORLD SYSTEM
+// =============================================================
+/* Tile legend:
+  。= empty, 墙 = wall, 土 = ground, 岩 = rock, 砖 = breakable brick,
+  水 = water, 门 = door, 梯 = ladder, 箱 = chest, 刺 = spike,
+  碑 = sign, 干 = tree trunk, 叶 = leaves (breakable), 果 = fruit,
+  云 = cloud (breakable), 草 = grass (breakable), 桥 = platform,
+  锁 = locked door, 灯 = lamp (breakable), 窗 = window (solid+breakable),
+  骨 = bone (solid+breakable), 灰 = ash (breakable),
+  NEW: 泥 = mud (slow), 冰 = ice (slide), 弹 = bounce pad,
+  风 = wind (push), 沼 = poison swamp (damage+slow),
+  雾 = fog (visual), 藤 = vine (climbable+slow fall)
+*/
+const TILE_DEF = {
+  '。': null,
+  '墙': {c:'墙',col:'#78909C',solid:true},
+  '土': {c:'土',col:'#8D6E63',solid:true},
+  '岩': {c:'岩',col:'#757575',solid:true},
+  '砖': {c:'砖',col:'#A1887F',solid:true,breakable:true},
+  '水': {c:'水',col:'#29B6F6',hazard:'slow'},
+  '门': {c:'门',col:'#5D4037',solid:true,interact:'door'},
+  '梯': {c:'梯',col:'#A1887F',climbable:true},
+  '箱': {c:'箱',col:'#FFC107',solid:true,interact:'chest'},
+  '刺': {c:'刺',col:'#9E9E9E',hazard:'damage'},
+  '碑': {c:'碑',col:'#607D8B',solid:true,interact:'sign'},
+  '干': {c:'树',col:'#795548'},
+  '叶': {c:'叶',col:'#4CAF50',breakable:true},
+  '果': {c:'果',col:'#FF9800',interact:'fruit'},
+  '云': {c:'云',col:'#CFD8DC',breakable:true},
+  '草': {c:'草',col:'#66BB6A',breakable:true},
+  '桥': {c:'桥',col:'#8D6E63',platform:true},
+  '锁': {c:'门',col:'#8B0000',solid:true,interact:'locked_door'},
+  '灯': {c:'灯',col:'#FFD600',breakable:true},
+  '窗': {c:'窗',col:'#81D4FA',solid:true,breakable:true},
+  '骨': {c:'骨',col:'#E0E0E0',solid:true,breakable:true},
+  '灰': {c:'灰',col:'#9E9E9E',breakable:true},
+  '柱': {c:'柱',col:'#9E9E9E'},
+  // NEW interactive tiles
+  '泥': {c:'泥',col:'#8B7355',hazard:'mud'},       // slow movement significantly
+  '冰': {c:'冰',col:'#B3E5FC',solid:true,surface:'ice'}, // icy surface, slide on top
+  '弹': {c:'弹',col:'#FF6F00',solid:true,surface:'bounce'}, // bounce pad
+  '风': {c:'风',col:'#90CAF9',hazard:'wind'},       // pushes player horizontally
+  '沼': {c:'沼',col:'#558B2F',hazard:'swamp'},      // poison swamp: damage + slow
+  '雾': {c:'雾',col:'#B0BEC5',hazard:'fog'},        // reduces visibility
+  '藤': {c:'藤',col:'#2E7D32',climbable:true,hazard:'vine'}, // climbable vine, slow fall
+  '路': {c:'路',col:'#A1887F',solid:true,interact:'door'},   // road exit, same behavior as door
+  '枝': {c:'枝',col:'#2E7D32',platform:true},               // branch platform, darker green
+  '熔': {c:'熔',col:'#E65100',solid:true,hazard:'lava'},     // lava block: contact damage + drips
+};
+
+// Monster chars on map → monster type
+const MONSTER_CHARS = {
+  '猪': '野猪',
+  '蛛': '毒蛛',
+  '蝠': '蝙蝠',
+  '骷': '骷髅',
+  '法': '火法师',
+  '影': '影',
+  '巨': '巨石人',
+  '将': '鬼将',
+  '龙': '火龙',
+  '王': '魔王',
+  '魔': '魔',
+  '蛇': '长蛇',
+  '妖': '树妖',
+  '灵': '冰灵',
+  '忍': '刺客',
+  '雷': '雷兽',
+  '炎': '熔炎魔',
+  '蟒': '冥蟒',
+  '傀': '古傀儡',
+};
+
+// Monster bestiary info: [displayChars, color, description]
+const MONSTER_INFO = {
+  '魔':     ['魔',  '#9C27B0','低级恶魔，在巡逻路径上来回游荡'],
+  '野猪':   ['野猪','#795548','横冲直撞的野猪，发现猎物会疯狂冲刺'],
+  '毒蛛':   ['毒蛛','#4CAF50','潜伏在高处的毒蛛，会突然从上方扑下'],
+  '蝙蝠':   ['蝙蝠','#616161','在洞穴中飞行的蝙蝠，轨迹难以预测'],
+  '火法师': ['火法','#FF5722','远程攻击的法师，发射灼热的火球'],
+  '骷髅':   ['骷髅','#ECEFF1','不死的骷髅战士，会投掷骨矛攻击'],
+  '巨石人': ['巨石','#757575','行动缓慢的巨石人，拥有恐怖的力量'],
+  '影':     ['影',  '#444444','来去无踪的暗影，速度极快但身体脆弱'],
+  '鬼将':   ['鬼将','#7E57C2','统领亡灵的鬼将，能召唤手下助战'],
+  '火龙':   ['火龙','#FF6D00','喷吐火焰的飞龙，翱翔于空中'],
+  '长蛇':   ['长蛇','#558B2F','蜿蜒爬行的长蛇，身体细长灵活'],
+  '树妖':   ['树妖','#2E7D32','伪装成树木的妖怪，会发射树叶攻击'],
+  '冰灵':   ['冰灵','#4FC3F7','冰霜精灵，飘浮于空中发射冰刺'],
+  '刺客':   ['刺客','#37474F','隐身潜行的刺客，会突然现身偷袭'],
+  '雷兽':   ['雷兽','#FDD835','浑身雷电的猛兽，会冲锋和震地攻击'],
+  '熔炎魔': ['熔炎','#BF360C','由岩浆构成的魔物，喷射熔炎弹'],
+  '冥蟒':   ['冥蟒','#CE93D8','深渊巨蟒，在空中盘旋后俯冲猎物'],
+  '古傀儡': ['古傀','#5D4037','远古石像，拥有护盾和连续拳击'],
+  '魔王':   ['魔王','#D50000','黑暗魔王，三阶段变身越战越强'],
+  '魔龙':   ['魔龙','#B71C1C','终极魔龙，翱翔天际喷吐龙焰'],
+};
+
+// Item chars on map → item type (removed 盾 and 币, added 盔)
+const ITEM_CHARS = {
+  '剑': '剑',
+  '枪': '枪',
+  '甲': '甲',
+  '鞋': '鞋',
+  '盔': '盔',
+  '钥': '钥',
+  '丹': '丹',
+  '肉': '肉',
+  '长': '长',
+  '火': '火',
+  '毒': '毒',
+};
+
+let levelMap = [];
+let levelW = 0, levelH = 0;
+let mapMonsters = [];
+let mapItems = [];
+
+function loadLevel(data) {
+  const rows = data.trim().split('\n');
+  levelH = rows.length;
+  levelW = 0;
+  levelMap = [];
+  mapMonsters = [];
+  mapItems = [];
+  for (let r=0;r<rows.length;r++) {
+    const chars = Array.from(rows[r]);
+    if (chars.length > levelW) levelW = chars.length;
+    for (let c=0;c<chars.length;c++) {
+      const ch = chars[c];
+      if (MONSTER_CHARS[ch]) {
+        mapMonsters.push([MONSTER_CHARS[ch], c, r]);
+        chars[c] = '。';
+      } else if (ITEM_CHARS[ch] && !TILE_DEF[ch]) {
+        mapItems.push([ITEM_CHARS[ch], c, r]);
+        chars[c] = '。';
+      }
+    }
+    levelMap.push(chars);
+  }
+  for (let r=0;r<levelMap.length;r++) {
+    const row = levelMap[r];
+    let padChar = row.length > 0 ? row[row.length - 1] : '。';
+    if (padChar === '路') padChar = '。';
+    while(row.length < levelW) row.push(padChar);
+  }
+}
+
+function getTile(gx,gy) {
+  if (gx<0||gy<0||gy>=levelH||gx>=levelW) return null;
+  const ch = levelMap[gy]?.[gx];
+  return TILE_DEF[ch] || null;
+}
+
+function setTile(gx,gy,ch) {
+  if (gx>=0&&gy>=0&&gy<levelH&&gx<levelW) levelMap[gy][gx]=ch;
+}
+
+function isSolid(gx,gy) {
+  const t = getTile(gx,gy);
+  return t && t.solid;
+}
+
+function isPlatform(gx,gy) {
+  const t = getTile(gx,gy);
+  return t && t.platform;
+}
+
+// Get surface type of the tile below an entity's feet
+function getSurfaceBelow(ent) {
+  const cx = Math.floor((ent.x+ent.w/2)/TILE);
+  const footY = Math.floor((ent.y+ent.h+2)/TILE);
+  const t = getTile(cx, footY);
+  if (t && t.surface) return t.surface;
+  return null;
+}
+
+function renderTiles(ctx) {
+  const sx = Math.max(0, Math.floor(cam.x/TILE)|0);
+  const sy = Math.max(0, Math.floor(cam.y/TILE)|0);
+  const ex = Math.min(levelW, Math.ceil((cam.x+GAME_W)/TILE)+1);
+  const ey = Math.min(levelH, Math.ceil((cam.y+GAME_H)/TILE)+1);
+  for (let y=sy;y<ey;y++) {
+    for (let x=sx;x<ex;x++) {
+      const ch = levelMap[y]?.[x];
+      const td = TILE_DEF[ch];
+      if (!td) continue;
+      const dx = x*TILE - cam.x + cam.shakeX;
+      const dy = y*TILE - cam.y + cam.shakeY;
+      let col = td.col;
+      // water animation
+      if (ch === '水') {
+        const wave = Math.sin(Date.now()*0.003 + x*0.5)*0.5+0.5;
+        col = wave > 0.5 ? '#29B6F6' : '#0288D1';
+      }
+      if (ch === '熔') {
+        const wave = Math.sin(Date.now()*0.003 + x*0.5)*0.5+0.5;
+        col = wave > 0.5 ? '#E65100' : '#F95120';
+      }
+      // mud bubbling
+      if (ch === '泥' && Math.random()<0.01) {
+        addParticle('泥', x*TILE+Math.random()*TILE, y*TILE, (Math.random()-0.5)*10, -15, '#8B7355', 8, 0.5, 100);
+      }
+      // swamp bubbling
+      if (ch === '沼') {
+        const wave = Math.sin(Date.now()*0.002 + x*0.7)*0.5+0.5;
+        col = wave > 0.5 ? '#558B2F' : '#33691E';
+        if (Math.random()<0.015) addParticle('毒', x*TILE+Math.random()*TILE, y*TILE, (Math.random()-0.5)*8, -20, '#4CAF50', 8, 0.6, 50);
+      }
+      // wind animation
+      if (ch === '风' && Math.random()<0.02) {
+        addParticle('风', x*TILE, y*TILE+Math.random()*TILE, 60+Math.random()*40, (Math.random()-0.5)*10, '#90CAF9', 10, 0.6, 0);
+      }
+      // fog animation
+      if (ch === '雾' && Math.random()<0.008) {
+        addParticle('雾', x*TILE+Math.random()*TILE, y*TILE+Math.random()*TILE, (Math.random()-0.5)*15, (Math.random()-0.5)*10, '#B0BEC5', 12, 0.6, 0);
+      }
+      // cloud drift
+      if (ch === '云') {
+        const drift = Math.sin(Date.now()*0.0006 + y*1.5)*12 + Math.sin(Date.now()*0.0015 + x*0.8)*4;
+        atlas.draw(ctx, td.c, TILE-8, col, dx+4+drift, dy+4);
+        continue;
+      }
+      // bounce pad pulse
+      if (ch === '弹') {
+        const pulse = Math.sin(Date.now()*0.006)*0.15+0.85;
+        ctx.save();
+        ctx.globalAlpha = pulse;
+        atlas.draw(ctx, td.c, TILE-8, col, dx+4, dy+4);
+        ctx.restore();
+        continue;
+      }
+      // vine sway
+      if (ch === '藤') {
+        const sway = Math.sin(Date.now()*0.002+x*2)*2;
+        atlas.draw(ctx, td.c, TILE-8, col, dx+4+sway, dy+4);
+        continue;
+      }
+      atlas.draw(ctx, td.c, TILE-8, col, dx+4, dy+4);
+      // Torch light particles
+      if (ch === '灯' && Math.random()<0.05) {
+        addParticle('光', x*TILE+8, y*TILE, (Math.random()-0.5)*20, -30-Math.random()*20, '#FFD600', 10, 0.8);
+      }
+    }
+  }
+}
+
+// =============================================================
+// SECTION 7: PLAYER SYSTEM
+// =============================================================
+const killStats = {}; // Track kills per monster type (persists across deaths)
+let deathMenuSel = 0; // 0 = continue, 1 = back to title
+let deathBtn1 = null; // {x,y,w,h} rect for "继续游戏" button
+let deathBtn2 = null; // {x,y,w,h} rect for "返回首页" button
+const player = {
+  x: 64, y: 200,
+  vx: 0, vy: 0,
+  w: 28, h: 52,
+  hp: 3, maxHp: 3,
+  facing: 1,
+  grounded: false,
+  weapon: null,
+  armor: 0,
+  shoes: false,
+  helmet: false,  // NEW: helmet replaces shield
+  hasKey: false,
+  fireWeapon: false,
+  poisonWeapon: false,
+  longWeapon: false,
+  frostWeapon: false,
+  attackTimer: 0,
+  attackCooldown: 0,
+  hurtTimer: 0,
+  animT: 0,
+  dead: false,
+  speed: PLAYER_SPEED,
+  damage: 1,
+  defense: 0,
+  attackRange: 30,
+  onIce: false,
+  mudSlow: 0,
+  windForce: 0,
+  inFog: false,
+  poisonTimer: 0,
+  fogTimer: 0,
+  // Dash state
+  dashState: 'none',
+  dashTimer: 0,
+  dashCooldown: 0,
+  dashDir: 1,
+  lastTapLeft: 0,
+  lastTapRight: 0,
+  prevLeft: false,
+  prevRight: false,
+  // Plunge state
+  plungeState: 'none',
+  plungeTimer: 0,
+  plungeHitDone: false,
+  // Attack hold tracking
+  attackHoldTime: 0,
+  _airAtkPending: false,
+};
+
+// =============================================================
+// STORY CHARACTER COLLECTION SYSTEM
+// =============================================================
+const storyChars = []; // collected story characters: '龙', '魔'
+let storyCharAnim = null; // {char, phase, timer, x, y, targetX, targetY}
+
+// =============================================================
+// WEATHER / ATMOSPHERE SYSTEM
+// =============================================================
+const weatherState = {
+  type: null, // 'fireRain' | null
+  darkSky: false,
+  bgColor: null, // override background color
+  fireRainTimer: 0,
+  fireRainParticles: [],
+};
+
+function resetWeather() {
+  weatherState.type = null;
+  weatherState.darkSky = false;
+  weatherState.bgColor = null;
+  weatherState.fireRainTimer = 0;
+  weatherState.fireRainParticles = [];
+}
+
+function updateWeather(dt) {
+  if (weatherState.type === 'fireRain') {
+    weatherState.fireRainTimer -= dt;
+    if (weatherState.fireRainTimer <= 0) {
+      weatherState.fireRainTimer = 0.08 + Math.random() * 0.12;
+      // Spawn fire rain particle in camera view
+      const vw = GAME_W / WORLD_SCALE;
+      const rx = cam.x + Math.random() * vw;
+      const ry = cam.y - 20;
+      const chars = ['火','焰','灼'];
+      const c = chars[Math.floor(Math.random()*chars.length)];
+      addParticle(c, rx, ry, (Math.random()-0.5)*30, 120+Math.random()*80, '#FF3D00', 10+Math.random()*8, 1.5+Math.random(), 50);
+    }
+  }
+  // Update fire rain particles
+  let wi = 0;
+  for (let i=0;i<weatherState.fireRainParticles.length;i++) {
+    const p = weatherState.fireRainParticles[i];
+    p.y += p.vy * dt;
+    p.life -= dt;
+    if (p.life > 0) weatherState.fireRainParticles[wi++] = p;
+  }
+  weatherState.fireRainParticles.length = wi;
+}
+
+function renderWeatherOverlay(ctx) {
+  if (weatherState.darkSky) {
+    ctx.fillStyle = 'rgba(20, 0, 0, 0.35)';
+    ctx.fillRect(0, 0, GAME_W, GAME_H);
+  }
+}
+
+// =============================================================
+// CUTSCENE FUSION SYSTEM
+// =============================================================
+let cutsceneState = null; // null or {phase, timer, totalTimer, ...}
+
+function startFusionCutscene() {
+  cutsceneState = {
+    phase: 'darken', // darken, char1fly, char2fly, merge, flash, reveal, transition
+    timer: 0,
+    totalTimer: 0,
+    char1: {c:'龙', x: GAME_W-80, y: 10, tx: GAME_W/2+20, ty: GAME_H/2-30, size: 24, alpha: 0},
+    char2: {c:'魔', x: GAME_W-50, y: 10, tx: GAME_W/2-50, ty: GAME_H/2-30, size: 24, alpha: 0},
+    mergedSize: 0,
+    flashAlpha: 0,
+    shakeIntensity: 0,
+    crackLines: [],
+    darkenAlpha: 0,
+  };
+  scene = 'cutscene_fusion';
+}
+
+function updateCutscene(dt) {
+  if (!cutsceneState) return;
+  const cs = cutsceneState;
+  cs.timer += dt;
+  cs.totalTimer += dt;
+
+  switch(cs.phase) {
+    case 'darken':
+      cs.darkenAlpha = Math.min(0.85, cs.timer * 0.85);
+      if (cs.timer >= 1.0) { cs.phase = 'char1fly'; cs.timer = 0; }
+      break;
+    case 'char1fly': {
+      const t = Math.min(1, cs.timer / 1.2);
+      const ease = t < 0.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2;
+      cs.char1.alpha = Math.min(1, cs.timer * 2);
+      cs.char1.x = cs.char1.x + (cs.char1.tx - cs.char1.x) * ease * 0.08;
+      cs.char1.y = cs.char1.y + (cs.char1.ty - cs.char1.y) * ease * 0.08;
+      cs.char1.size = 24 + t * 20;
+      // Glow particles
+      if (Math.random() < 0.3) addParticle('光', cs.char1.x+Math.random()*30, cs.char1.y+Math.random()*30, (Math.random()-0.5)*40, (Math.random()-0.5)*40, '#FF6D00', 8, 0.4);
+      if (cs.timer >= 1.5) { cs.phase = 'char2fly'; cs.timer = 0; }
+      break;
+    }
+    case 'char2fly': {
+      const t = Math.min(1, cs.timer / 1.2);
+      const ease = t < 0.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2;
+      cs.char2.alpha = Math.min(1, cs.timer * 2);
+      cs.char2.x = cs.char2.x + (cs.char2.tx - cs.char2.x) * ease * 0.08;
+      cs.char2.y = cs.char2.y + (cs.char2.ty - cs.char2.y) * ease * 0.08;
+      cs.char2.size = 24 + t * 20;
+      // Continue moving char1 to final pos
+      cs.char1.x += (cs.char1.tx - cs.char1.x) * 0.05;
+      cs.char1.y += (cs.char1.ty - cs.char1.y) * 0.05;
+      if (Math.random() < 0.3) addParticle('光', cs.char2.x+Math.random()*30, cs.char2.y+Math.random()*30, (Math.random()-0.5)*40, (Math.random()-0.5)*40, '#9C27B0', 8, 0.4);
+      if (cs.timer >= 1.5) { cs.phase = 'merge'; cs.timer = 0; }
+      break;
+    }
+    case 'merge': {
+      const t = Math.min(1, cs.timer / 1.5);
+      // Move both chars toward center
+      const cx = GAME_W/2 - 15;
+      const cy = GAME_H/2 - 30;
+      cs.char1.x += (cx - cs.char1.x) * 0.1;
+      cs.char1.y += (cy - cs.char1.y) * 0.1;
+      cs.char2.x += (cx - cs.char2.x) * 0.1;
+      cs.char2.y += (cy - cs.char2.y) * 0.1;
+      cs.char1.size += (48 - cs.char1.size) * 0.05;
+      cs.char2.size += (48 - cs.char2.size) * 0.05;
+      // Rotation-like wobble via particles
+      for (let i=0;i<2;i++) addParticle('光', cx+Math.random()*60-30, cy+Math.random()*60-30, (Math.random()-0.5)*80, (Math.random()-0.5)*80, Math.random()>0.5?'#FF3D00':'#9C27B0', 10, 0.5);
+      cs.shakeIntensity = t * 6;
+      if (cs.timer >= 1.5) { cs.phase = 'flash'; cs.timer = 0; }
+      break;
+    }
+    case 'flash':
+      cs.flashAlpha = 1 - cs.timer * 2;
+      cs.shakeIntensity = (1 - cs.timer * 2) * 12;
+      if (cs.timer >= 0.5) { cs.phase = 'reveal'; cs.timer = 0; cs.mergedSize = 0; }
+      break;
+    case 'reveal': {
+      const t = Math.min(1, cs.timer / 1.5);
+      cs.mergedSize = t * 72;
+      cs.darkenAlpha = 0.85;
+      // Epic particles
+      if (Math.random() < 0.4) {
+        const angle = Math.random() * Math.PI * 2;
+        const spd = 60 + Math.random() * 100;
+        addParticle('鳞', GAME_W/2+Math.cos(angle)*30, GAME_H/2-20+Math.sin(angle)*30, Math.cos(angle)*spd, Math.sin(angle)*spd, '#B71C1C', 12, 0.6);
+      }
+      if (cs.timer >= 1.5) { cs.phase = 'transition'; cs.timer = 0; }
+      break;
+    }
+    case 'transition': {
+      // Generate crack lines
+      if (cs.crackLines.length < 15) {
+        cs.crackLines.push({
+          x: GAME_W/2 + (Math.random()-0.5)*40,
+          y: GAME_H/2 + (Math.random()-0.5)*40,
+          dx: (Math.random()-0.5) * GAME_W,
+          dy: (Math.random()-0.5) * GAME_H,
+          t: 0,
+        });
+      }
+      for (const cl of cs.crackLines) cl.t = Math.min(1, cl.t + dt * 3);
+      cs.flashAlpha = cs.timer / 1.0;
+      if (cs.timer >= 1.0) {
+        // End cutscene, proceed to level 18 (魔域边境)
+        cutsceneState = null;
+        particles.length = 0;
+        startLevel(currentLevel + 1);
+      }
+      break;
+    }
+  }
+}
+
+function renderCutscene(ctx) {
+  if (!cutsceneState) return;
+  const cs = cutsceneState;
+
+  // Dark background
+  ctx.fillStyle = `rgba(0,0,0,${cs.darkenAlpha})`;
+  ctx.fillRect(0, 0, GAME_W, GAME_H);
+
+  // Shake offset
+  const sx = (Math.random()-0.5) * cs.shakeIntensity;
+  const sy = (Math.random()-0.5) * cs.shakeIntensity;
+  ctx.save();
+  ctx.translate(sx, sy);
+
+  // Draw flying characters
+  if (cs.phase !== 'reveal' && cs.phase !== 'transition') {
+    if (cs.char1.alpha > 0) {
+      atlas.draw(ctx, cs.char1.c, Math.round(cs.char1.size), '#FF6D00', cs.char1.x, cs.char1.y, cs.char1.alpha);
+    }
+    if (cs.char2.alpha > 0) {
+      atlas.draw(ctx, cs.char2.c, Math.round(cs.char2.size), '#9C27B0', cs.char2.x, cs.char2.y, cs.char2.alpha);
+    }
+  }
+
+  // Draw merged 魔龙
+  if (cs.mergedSize > 0) {
+    const msz = Math.round(cs.mergedSize);
+    const mx = GAME_W/2 - msz * 0.55;
+    const my = GAME_H/2 - msz * 0.5;
+    atlas.draw(ctx, '魔', msz, '#B71C1C', mx, my);
+    atlas.draw(ctx, '龙', msz, '#FF3D00', mx + msz * 0.9, my);
+  }
+
+  // Crack lines in transition phase
+  if (cs.phase === 'transition') {
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    for (const cl of cs.crackLines) {
+      ctx.beginPath();
+      ctx.moveTo(cl.x, cl.y);
+      ctx.lineTo(cl.x + cl.dx * cl.t, cl.y + cl.dy * cl.t);
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+
+  // Flash overlay
+  if (cs.flashAlpha > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${Math.max(0, Math.min(1, cs.flashAlpha))})`;
+    ctx.fillRect(0, 0, GAME_W, GAME_H);
+  }
+
+  // Render particles on top
+  _renderPhase = true;
+  renderParticles(ctx);
+  _renderPhase = false;
+  flushPendingParticles();
+}
+
+function resetPlayer() {
+  player.hp = 3; player.maxHp = 3;
+  player.vx = 0; player.vy = 0;
+  player.weapon = null; player.armor = 0; player.shoes = false;
+  player.helmet = false; player.hasKey = false;
+  player.fireWeapon = false; player.poisonWeapon = false; player.longWeapon = false; player.frostWeapon = false;
+  player.attackTimer = 0; player.attackCooldown = 0; player.hurtTimer = 0;
+  player.dead = false; player.facing = 1;
+  player.speed = PLAYER_SPEED; player.damage = 1; player.defense = 0; player.attackRange = 30;
+  player.onIce = false; player.mudSlow = 0; player.windForce = 0;
+  player.inFog = false; player.poisonTimer = 0; player.fogTimer = 0;
+  player.dashState = 'none'; player.dashTimer = 0; player.dashCooldown = 0;
+  player.dashDir = 1; player.lastTapLeft = 0; player.lastTapRight = 0;
+  player.prevLeft = false; player.prevRight = false;
+  player.plungeState = 'none'; player.plungeTimer = 0; player.plungeHitDone = false;
+  player.attackHoldTime = 0; player._airAtkPending = false;
+}
+
+function recalcStats() {
+  player.speed = player.shoes ? PLAYER_SPEED * 1.5 : PLAYER_SPEED;
+  let dmg = 1, range = 25;
+  if (player.weapon) {
+    dmg = 2; range = 35;
+    if (player.longWeapon) { dmg += 1; range = 55; }
+    if (player.fireWeapon) dmg += 1;
+    if (player.poisonWeapon) dmg += 1;
+    if (player.frostWeapon) dmg += 1;
+  }
+  player.damage = dmg;
+  player.attackRange = range;
+  player.defense = 0;
+}
+
+const WEAPONS = new Set(['剑','枪']);
+const MODIFIERS = new Set(['长','火','毒','霜']);
+
+const HEAL_ITEMS = new Set(['果','肉','丹']);
+
+function canEquip(item) {
+  if (HEAL_ITEMS.has(item) && player.hp >= player.maxHp) return false;
+  if (WEAPONS.has(item)) return true;
+  if (MODIFIERS.has(item)) {
+    if (!player.weapon) return false;
+    if (item === '长' && player.longWeapon) return false;
+    if (item === '火' && player.fireWeapon) return false;
+    if (item === '毒' && player.poisonWeapon) return false;
+    if (item === '霜' && player.frostWeapon) return false;
+    return true;
+  }
+  return true;
+}
+
+function equipItem(item) {
+  switch(item) {
+    case '剑':
+    case '枪':
+      if (player.weapon) dropCurrentWeapon();
+      player.weapon = item;
+      break;
+    case '长':
+      if (player.weapon) player.longWeapon = true;
+      break;
+    case '火':
+      if (player.weapon) player.fireWeapon = true;
+      break;
+    case '毒':
+      if (player.weapon) player.poisonWeapon = true;
+      break;
+    case '霜':
+      if (player.weapon) player.frostWeapon = true;
+      break;
+    case '血':
+      player.maxHp += 1;
+      player.hp = Math.min(player.hp+1, player.maxHp);
+      addParticle('血', player.x, player.y-20, 0, -40, '#C62828', 18, 1.0);
+      break;
+    case '甲': player.armor = Math.min(player.armor + 2, 2); break;
+    case '鞋': player.shoes = true; break;
+    case '盔': player.helmet = true; break;  // NEW: helmet
+    case '钥': player.hasKey = true; break;
+    case '果':
+      player.hp = Math.min(player.hp+1, player.maxHp);
+      addParticle('愈', player.x, player.y-20, 0, -40, '#4CAF50', 16, 0.8);
+      break;
+    case '肉':
+      player.hp = Math.min(player.hp+2, player.maxHp);
+      addParticle('愈', player.x, player.y-20, 0, -40, '#4CAF50', 16, 0.8);
+      break;
+    case '丹':
+      player.hp = player.maxHp;
+      addParticle('愈', player.x, player.y-20, 0, -40, '#E040FB', 18, 1.0);
+      break;
+  }
+  recalcStats();
+}
+
+function dropCurrentWeapon() {
+  if (!player.weapon) return;
+  spawnItem(player.weapon, player.x + player.facing * 20, player.y, true);
+  if (player.fireWeapon) spawnItem('火', player.x + player.facing * 24, player.y - 10, true);
+  if (player.poisonWeapon) spawnItem('毒', player.x + player.facing * 28, player.y - 20, true);
+  if (player.longWeapon) spawnItem('长', player.x + player.facing * 32, player.y - 30, true);
+  if (player.frostWeapon) spawnItem('霜', player.x + player.facing * 36, player.y - 40, true);
+  player.weapon = null;
+  player.fireWeapon = false;
+  player.poisonWeapon = false;
+  player.longWeapon = false;
+  player.frostWeapon = false;
+}
+
+function getWeaponName() {
+  if (!player.weapon) return '拳';
+  let name = '';
+  if (player.frostWeapon) name += '霜';
+  if (player.fireWeapon) name += '火';
+  if (player.poisonWeapon) name += '毒';
+  if (player.longWeapon) name += '长';
+  name += player.weapon;
+  return name;
+}
+
+function playerUpdate(dt) {
+  if (player.dead) return;
+  player.animT += dt;
+  player.attackTimer = Math.max(0, player.attackTimer - dt);
+  player.attackCooldown = Math.max(0, player.attackCooldown - dt);
+  player.hurtTimer = Math.max(0, player.hurtTimer - dt);
+  player.dashCooldown = Math.max(0, player.dashCooldown - dt);
+
+  // --- Attack hold tracking for plunge ---
+  if (input.attack) player.attackHoldTime += dt;
+  else player.attackHoldTime = 0;
+
+  // --- Double-tap detection for dash ---
+  const now = player.animT;
+  if (input.left && !player.prevLeft) {
+    if (now - player.lastTapLeft < DOUBLE_TAP_WINDOW && player.dashCooldown <= 0 && player.dashState === 'none' && player.plungeState === 'none') {
+      player.dashState = 'dashing'; player.dashTimer = DASH_DURATION;
+      player.dashDir = -1; player.dashCooldown = DASH_COOLDOWN;
+      player.facing = -1;
+      addParticle('冲', player.x+player.w/2, player.y+player.h/2, 60, 0, '#2196F3', 18, 0.3);
+    }
+    player.lastTapLeft = now;
+  }
+  if (input.right && !player.prevRight) {
+    if (now - player.lastTapRight < DOUBLE_TAP_WINDOW && player.dashCooldown <= 0 && player.dashState === 'none' && player.plungeState === 'none') {
+      player.dashState = 'dashing'; player.dashTimer = DASH_DURATION;
+      player.dashDir = 1; player.dashCooldown = DASH_COOLDOWN;
+      player.facing = 1;
+      addParticle('冲', player.x+player.w/2, player.y+player.h/2, -60, 0, '#2196F3', 18, 0.3);
+    }
+    player.lastTapRight = now;
+  }
+  player.prevLeft = input.left;
+  player.prevRight = input.right;
+
+  // --- Plunge state machine ---
+  if (player.plungeState === 'charging') {
+    player.plungeTimer -= dt;
+    player.vx *= 0.5;
+    player.vy = 0;
+    if (player.plungeTimer <= 0) {
+      player.plungeState = 'plunging';
+    }
+  } else if (player.plungeState === 'plunging') {
+    player.vy = PLUNGE_SPEED;
+    player.vx = 0;
+    if (Math.random() < 0.5) addParticle('坠', player.x+player.w/2, player.y-5, (Math.random()-0.5)*20, -40, '#FF8F00', 16, 0.25, 0);
+    if (player.grounded && !player.plungeHitDone) {
+      doPlungeLanding();
+      player.plungeHitDone = true;
+    }
+  } else if (player.plungeState === 'landing') {
+    player.plungeTimer -= dt;
+    player.vx *= 0.3;
+    if (player.plungeTimer <= 0) {
+      player.plungeState = 'none';
+      player.attackHoldTime = 0; // prevent immediate re-trigger
+    }
+  }
+  // Trigger plunge: in air, holding attack, not dashing, and meaningfully airborne
+  if (player.plungeState === 'none' && !player.grounded && player.coyoteTime <= 0 && player.attackHoldTime > PLUNGE_HOLD_THRESHOLD && player.dashState === 'none') {
+    player.plungeState = 'charging';
+    player.plungeTimer = 0.12;
+    player.plungeHitDone = false;
+    player.attackHoldTime = 0;
+  }
+
+  // --- Dash state machine ---
+  if (player.dashState === 'dashing') {
+    player.dashTimer -= dt;
+    player.vx = DASH_SPEED * player.dashDir;
+    player.vy = 0; // no gravity during dash
+    // Dash trail
+    if (Math.random() < 0.6) addParticle('冲', player.x+player.w/2 - player.dashDir*20, player.y+player.h/2, -player.dashDir*30, (Math.random()-0.5)*20, '#90CAF9', 14, 0.2, 0);
+    // Dash attack if attack pressed during dash
+    if (input.attackPressed && player.attackCooldown <= 0) {
+      doDashAttack();
+    }
+    if (player.dashTimer <= 0) {
+      player.dashState = 'none';
+      player.vx = player.dashDir * player.speed * 0.5; // decelerate after dash
+    }
+  }
+
+  // Coyote time
+  if (player.grounded) player.coyoteTime = 0.1;
+  else player.coyoteTime = Math.max(0, (player.coyoteTime||0) - dt);
+
+  // Jump buffer
+  if (input.jumpPressed) input.jumpBuffer = 0.12;
+  else input.jumpBuffer = Math.max(0, input.jumpBuffer - dt);
+
+  // Check if on ladder/vine
+  const pcx = Math.floor((player.x+player.w/2)/TILE);
+  const pcy = Math.floor((player.y+player.h/2)/TILE);
+  const tileAtPlayer = getTile(pcx, pcy);
+  const onLadder = tileAtPlayer && tileAtPlayer.climbable;
+
+  // Reset per-frame hazard states
+  player.onIce = false;
+  player.mudSlow = 0;
+  player.windForce = 0;
+
+  // Check hazards at player position
+  const hazardTile = tileAtPlayer;
+  if (hazardTile) {
+    if (hazardTile.hazard === 'mud') player.mudSlow = 0.35;
+    if (hazardTile.hazard === 'wind') player.windForce = 360;
+    if (hazardTile.hazard === 'fog') player.fogTimer = 2.4;
+    if (hazardTile.hazard === 'vine') player.mudSlow = 0.7; // vine slightly slows
+    if (hazardTile.hazard === 'swamp') {
+      player.mudSlow = 0.3;
+      player.poisonTimer += dt;
+      if (player.poisonTimer > 0.8) {
+        hurtPlayer(1);
+        player.poisonTimer = 0;
+        addParticle('毒', player.x+player.w/2, player.y, 0, -30, '#4CAF50', 14, 0.5);
+      }
+    }
+  } else {
+    player.poisonTimer = Math.max(0, player.poisonTimer - dt*2);
+  }
+
+  // Fog timer: decays so fog effect persists after contact (reduced 40%)
+  if (player.fogTimer > 0) {
+    player.fogTimer -= dt * 0.8;
+    player.inFog = true;
+  } else {
+    player.inFog = false;
+  }
+
+  // Check surface below (ice, bounce)
+  const surf = getSurfaceBelow(player);
+  if (surf === 'ice' && player.grounded) player.onIce = true;
+  if (surf === 'bounce' && player.grounded) {
+    player.vy = PLAYER_JUMP * 1.6; // super bounce
+    player.grounded = false;
+    addParticle('弹', player.x+player.w/2, player.y+player.h, 0, 10, '#FF6F00', 16, 0.3);
+    cam.shake(3, 0.1);
+  }
+
+  // Effective speed with mud/ice
+  let effectiveSpeed = player.speed;
+  if (player.mudSlow > 0) effectiveSpeed *= player.mudSlow;
+
+  // Movement (skip during dash/plunge)
+  const normalMove = player.dashState === 'none' && player.plungeState === 'none';
+  if (normalMove) {
+  if (player.onIce) {
+    // Ice: very slippery - minimal control, nearly no friction (2x enhanced)
+    if (input.left) { player.vx -= effectiveSpeed * dt * 1.25; player.facing = -1; }
+    else if (input.right) { player.vx += effectiveSpeed * dt * 1.25; player.facing = 1; }
+    else { player.vx *= 0.9996; } // nearly zero friction on ice
+    // Allow much higher speed on ice for dramatic sliding
+    if (Math.abs(player.vx) > effectiveSpeed * 2.2) player.vx = Math.sign(player.vx) * effectiveSpeed * 2.2;
+  } else {
+    if (input.left) { player.vx = -effectiveSpeed; player.facing = -1; }
+    else if (input.right) { player.vx = effectiveSpeed; player.facing = 1; }
+    else { player.vx *= FRICTION; if (Math.abs(player.vx) < 5) player.vx = 0; }
+  }
+
+  // Wind push
+  if (player.windForce !== 0) {
+    player.vx += player.windForce * dt;
+  }
+  } // end normalMove
+
+  // Ladder climbing (skip during dash/plunge)
+  if (normalMove) {
+  if (onLadder) {
+    if (input.jump) {
+      player.vy = -120;
+    } else {
+      player.vy = 30;
+    }
+    player.grounded = true;
+  } else {
+    // Jump
+    if (input.jumpBuffer > 0 && (player.grounded || player.coyoteTime > 0)) {
+      player.vy = PLAYER_JUMP;
+      player.grounded = false;
+      player.coyoteTime = 0;
+      input.jumpBuffer = 0;
+    }
+    // Gravity
+    player.vy += GRAVITY * dt;
+    if (player.vy > MAX_FALL) player.vy = MAX_FALL;
+  }
+  } // end normalMove for gravity
+
+  // Move X
+  player.x += player.vx * dt;
+  resolveCollisionX(player);
+
+  // Move Y
+  player.y += player.vy * dt;
+  player.grounded = false;
+  resolveCollisionY(player);
+
+  // World bounds
+  if (player.x < 0) player.x = 0;
+  if (player.x > levelW*TILE - player.w) player.x = levelW*TILE - player.w;
+
+  // Hazards (damage/slow from old tiles)
+  const cx = Math.floor((player.x+player.w/2)/TILE);
+  const cy = Math.floor((player.y+player.h/2)/TILE);
+  const tile = getTile(cx,cy);
+  if (tile && tile.hazard === 'damage') hurtPlayer(1);
+  if (tile && tile.hazard === 'lava') { 
+    hurtPlayer(1); 
+    addParticle('烫', player.x+player.w/2, player.y-8, (Math.random()-0.5)*30, -40, '#FF6D00', 14, 0.4); 
+  }
+  if (tile && tile.hazard === 'slow') player.vx *= 0.5;
+
+  // Fall death
+  if (player.y > levelH * TILE + 100) {
+    if (godMode) { player.y = 0; player.vy = 0; }
+    else { player.hp = 0; player.dead = true; }
+  }
+}
+
+function resolveCollisionX(ent) {
+  const left = Math.floor(ent.x/TILE);
+  const right = Math.floor((ent.x+ent.w-1)/TILE);
+  const top = Math.floor(ent.y/TILE);
+  const bot = Math.floor((ent.y+ent.h-1)/TILE);
+  for (let y=top;y<=bot;y++) {
+    for (let x=left;x<=right;x++) {
+      if (isSolid(x,y)) {
+        if (ent.vx > 0) { ent.x = x*TILE - ent.w; ent.vx = 0; }
+        else if (ent.vx < 0) { ent.x = (x+1)*TILE; ent.vx = 0; }
+      }
+    }
+  }
+}
+
+function resolveCollisionY(ent) {
+  const left = Math.floor(ent.x/TILE);
+  const right = Math.floor((ent.x+ent.w-1)/TILE);
+  const top = Math.floor(ent.y/TILE);
+  const bot = Math.floor((ent.y+ent.h-1)/TILE);
+  for (let y=top;y<=bot;y++) {
+    for (let x=left;x<=right;x++) {
+      const solid = isSolid(x,y);
+      const plat = isPlatform(x,y);
+      if (solid) {
+        if (ent.vy > 0) { ent.y = y*TILE - ent.h; ent.vy = 0; ent.grounded = true; }
+        else if (ent.vy < 0) { ent.y = (y+1)*TILE; ent.vy = 0; }
+      } else if (plat && ent.vy >= 0) {
+        const entBot = ent.y + ent.h;
+        const platTop = y * TILE;
+        if (entBot > platTop && entBot <= platTop + ent.vy * 0.05 + 10) {
+          ent.y = platTop - ent.h;
+          ent.vy = 0;
+          ent.grounded = true;
+        }
+      }
+    }
+  }
+}
+
+function hurtPlayer(dmg) {
+  if (godMode) return;
+  if (player.hurtTimer > 0 || player.dead) return;
+  let actual = Math.max(1, dmg);
+  // Helmet absorbs hit first (before armor)
+  if (player.helmet) {
+    player.helmet = false;
+    addParticle('盔', player.x+player.w/2, player.y-10, (Math.random()-0.5)*40, -60, '#FF8F00', 16, 0.5, 0);
+    player.hurtTimer = 2.0;
+    cam.shake(3, 0.1);
+    return; // helmet absorbed the hit
+  }
+  // Armor absorbs damage next
+  if (player.armor > 0) {
+    player.armor -= 1;
+    addParticle('甲', player.x+player.w/2, player.y-10, (Math.random()-0.5)*40, -60, '#FFD600', 16, 0.5, 0);
+    player.hurtTimer = 2.0;
+    cam.shake(3, 0.1);
+    recalcStats();
+    return; // armor absorbed the hit
+  }
+  player.hp -= actual;
+  player.hurtTimer = 2.0;
+  cam.shake(4, 0.15);
+  addParticle('痛', player.x+player.w/2, player.y, (Math.random()-0.5)*60, -80, '#F44336', 18, 0.6, 100);
+  if (player.hp <= 0) { player.hp = 0; player.dead = true; }
+}
+
+function doPlayerAttack() {
+  const f = player.facing;
+  let ax, ay, aw, ah, dmg = player.damage;
+
+  if (player.weapon === '剑') {
+    const range = player.attackRange;
+    ax = f > 0 ? player.x + player.w : player.x - range;
+    ay = player.y - 8;
+    aw = range;
+    ah = player.h + 16;
+    const px = f > 0 ? player.x + player.w + 14 : player.x - 24;
+    addParticle('斩', px, player.y - 4, f*100, -50, '#FFD600', 20, 0.3, 0);
+    addParticle('斩', px, player.y + 20, f*120, 30, '#FFD600', 18, 0.25, 0);
+  } else if (player.weapon === '枪') {
+    const range = player.attackRange + 10;
+    ax = f > 0 ? player.x + player.w : player.x - range;
+    ay = player.y + 8;
+    aw = range;
+    ah = player.h - 16;
+    const px = f > 0 ? player.x + player.w + 15 : player.x - 25;
+    addParticle('刺', px, player.y+player.h/2-5, f*160, 0, '#607D8B', 18, 0.25, 0);
+    player.vx += f * 80;
+  } else {
+    ax = f > 0 ? player.x + player.w : player.x - player.attackRange;
+    ay = player.y;
+    aw = player.attackRange;
+    ah = player.h;
+  }
+
+  for (const m of monsters) {
+    if (m.dead) continue;
+    if (aabbHit(ax,ay,aw,ah, m.x,m.y,m.w,m.h)) {
+      hurtMonster(m, dmg);
+    }
+  }
+  checkAttackInteract(ax,ay,aw,ah);
+}
+
+function aabbHit(ax,ay,aw,ah,bx,by,bw,bh) {
+  return ax<bx+bw && ax+aw>bx && ay<by+bh && ay+ah>by;
+}
+
+function doDashAttack() {
+  const f = player.dashDir;
+  player.facing = f;
+  const range = Math.round(player.attackRange * DASH_ATK_RANGE_MULT);
+  const dmg = Math.ceil(player.damage * DASH_ATK_DMG_MULT);
+  let ax, ay, aw, ah;
+  const px = f > 0 ? player.x + player.w + 10 : player.x - 20;
+
+  if (player.weapon === '剑') {
+    ax = f > 0 ? player.x + player.w - 10 : player.x - range + 10;
+    ay = player.y - 20;
+    aw = range;
+    ah = player.h + 40;
+    for (let i = 0; i < 3; i++) {
+      addParticle('斩', px + f*i*12, player.y - 10 + i*15, f*150, (i-1)*40, '#FFD600', 22, 0.35, 0);
+    }
+  } else if (player.weapon === '枪') {
+    const pierceRange = range + 20;
+    ax = f > 0 ? player.x + player.w : player.x - pierceRange;
+    ay = player.y + 5;
+    aw = pierceRange;
+    ah = player.h - 10;
+    addParticle('刺', px, player.y+player.h/2, f*200, 0, '#607D8B', 20, 0.3, 0);
+    addParticle('冲', px + f*15, player.y+player.h/2-5, f*180, 0, '#90CAF9', 18, 0.25, 0);
+    player.vx += f * 120;
+  } else {
+    ax = f > 0 ? player.x + player.w : player.x - range;
+    ay = player.y - 5;
+    aw = range;
+    ah = player.h + 10;
+  }
+
+  for (const m of monsters) {
+    if (m.dead) continue;
+    if (aabbHit(ax,ay,aw,ah, m.x,m.y,m.w,m.h)) hurtMonster(m, dmg);
+  }
+  checkAttackInteract(ax,ay,aw,ah);
+  player.attackTimer = 0.25;
+  player.attackCooldown = 0.4;
+  player.dashState = 'none';
+  player.dashTimer = 0;
+  cam.shake(5, 0.15);
+}
+
+function doPlungeLanding() {
+  const cx = player.x + player.w/2;
+  const cy = player.y + player.h;
+  const range = 60;
+  const dmg = Math.ceil(player.damage * 2);
+  for (const m of monsters) {
+    if (m.dead) continue;
+    const mx = m.x + m.w/2, my = m.y + m.h/2;
+    if (Math.abs(mx-cx) < range && Math.abs(my-cy) < range) {
+      hurtMonster(m, dmg);
+    }
+  }
+  // Break nearby breakable tiles (砖, 草, 叶, 云, 灯, 窗, 骨, 灰, 箱)
+  checkAttackInteract(cx - range, cy - range, range*2, range*2);
+  for (let i = 0; i < 6; i++) {
+    const ang = i/6 * Math.PI * 2;
+    addParticle('震', cx, cy, Math.cos(ang)*80, Math.sin(ang)*60-30, '#FF8F00', 18, 0.4, 100);
+  }
+  addParticle('坠', cx, cy-10, 0, -50, '#FF8F00', 22, 0.5, 0);
+  cam.shake(6, 0.2);
+  player.plungeState = 'landing';
+  player.plungeTimer = 0.2;
+}
+
+function renderPlayer(ctx) {
+  if (player.dead) return;
+  const ox = player.x - cam.x + cam.shakeX;
+  const oy = player.y - cam.y + cam.shakeY;
+  const s = SCALE;
+  const flash = player.hurtTimer > 0 && Math.floor(player.hurtTimer*10)%2===0;
+  const fc = flash ? '#F44336' : null;
+  const f = player.facing;
+  const moving = Math.abs(player.vx) > 40;
+  const bob = moving ? Math.sin(player.animT*8)*2 : 0;
+  const legOff = moving ? Math.sin(player.animT*10)*3 : 0;
+  const atkOff = player.attackTimer > 0 ? 12*f : 0;
+  const cx = ox + player.w/2;
+  const cy = oy;
+  const sz = 13;
+  const headSz = 16;
+
+  let hurtScale = 1;
+  if (player.hurtTimer > 0) {
+    hurtScale = 1 - 0.25 * Math.abs(Math.sin(player.hurtTimer * 12));
+  }
+  const hurtAlpha = (player.hurtTimer > 0 && Math.floor(player.hurtTimer * 8) % 2 === 0) ? 0.3 : 1;
+
+  // --- Dash afterimage effect ---
+  if (player.dashState === 'dashing') {
+    for (let gi = 2; gi >= 1; gi--) {
+      const ga = 0.15 / gi;
+      const gx = ox - player.dashDir * gi * 14;
+      const gy = oy;
+      const gcx = gx + player.w/2;
+      ctx.globalAlpha = ga;
+      atlas.draw(ctx,'头',headSz,'#90CAF9', gcx-headSz/2, gy);
+      atlas.draw(ctx,'身',sz,'#90CAF9', gcx-sz/2, gy+headSz);
+      atlas.draw(ctx,'体',sz,'#90CAF9', gcx-sz/2, gy+headSz+sz);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // --- Plunge visual effect ---
+  if (player.plungeState === 'plunging') {
+    ctx.globalAlpha = 0.4;
+    atlas.draw(ctx,'坠',20,'#FF8F00', cx-10, oy+player.h);
+    ctx.globalAlpha = 1;
+  }
+  if (player.plungeState === 'landing') {
+    const t = 1 - player.plungeTimer / 0.2;
+    const ringR = 20 + t * 40;
+    ctx.strokeStyle = '#FF8F00';
+    ctx.lineWidth = 3 - t * 2;
+    ctx.globalAlpha = 1 - t;
+    ctx.beginPath();
+    ctx.ellipse(cx, oy+player.h, ringR, ringR*0.4, 0, 0, Math.PI*2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // Head (盔 replaces 头 when helmet is equipped)
+  const headChar = player.helmet ? '盔' : '头';
+  const headCol = player.helmet ? (fc||'#FF8F00') : (fc||'#4E342E');
+  const headX = cx - headSz/2;
+  const headY = cy + bob;
+  if (hurtScale < 1) {
+    ctx.save();
+    ctx.translate(headX + headSz/2, headY + headSz/2);
+    ctx.scale(hurtScale, hurtScale);
+    ctx.globalAlpha = hurtAlpha;
+    atlas.draw(ctx,headChar,headSz,headCol, -headSz/2, -headSz/2);
+    ctx.restore();
+  } else {
+    atlas.draw(ctx,headChar,headSz,headCol, headX, headY);
+  }
+
+  const bodyY = cy + headSz + bob;
+
+  // Body
+  const topChar = player.armor >= 2 ? '甲' : (player.armor === 1 ? '甲' : '身');
+  const topCol = player.armor >= 2 ? '#FFD600' : (player.armor === 1 ? '#FFD600' : '#1565C0');
+  const botChar = player.armor >= 2 ? '甲' : '体';
+  const botCol = player.armor >= 2 ? '#FFD600' : '#1565C0';
+  if (hurtScale < 1) {
+    ctx.save();
+    ctx.translate(cx, bodyY + sz);
+    ctx.scale(hurtScale, hurtScale);
+    ctx.globalAlpha = hurtAlpha;
+    atlas.draw(ctx, topChar, sz, fc||topCol, -sz/2, -sz);
+    atlas.draw(ctx, botChar, sz, fc||botCol, -sz/2, 0);
+    ctx.restore();
+  } else {
+    atlas.draw(ctx, topChar, sz, fc||topCol, cx-sz/2, bodyY);
+    atlas.draw(ctx, botChar, sz, fc||botCol, cx-sz/2, bodyY+sz);
+  }
+
+  // Hands
+  atlas.draw(ctx,'手',sz,fc||'#4E342E', cx-sz/2-sz, bodyY, hurtAlpha);
+  atlas.draw(ctx,'手',sz,fc||'#4E342E', cx+sz/2, bodyY, hurtAlpha);
+
+  // Weapon
+  if (player.weapon) {
+    const wChars = [];
+    if (player.frostWeapon) wChars.push({c:'霜',col:'#4FC3F7'});
+    if (player.fireWeapon) wChars.push({c:'火',col:'#FF5722'});
+    if (player.poisonWeapon) wChars.push({c:'毒',col:'#4CAF50'});
+    if (player.longWeapon) wChars.push({c:'长',col:'#9E9E9E'});
+    const baseCol = player.frostWeapon?'#4FC3F7':player.fireWeapon?'#FF5722':player.poisonWeapon?'#4CAF50':'#B0BEC5';
+    wChars.push({c:player.weapon, col:baseCol});
+
+    const isSword = player.weapon === '剑';
+    const isSpear = player.weapon === '枪';
+    const attacking = player.attackTimer > 0;
+    const pivotX = f===1 ? cx+sz/2+sz : cx-sz/2-sz;
+    const pivotY = bodyY + sz/2;
+
+    if (isSword) {
+      let angle;
+      if (attacking) {
+        const t = 1 - player.attackTimer / 0.2;
+        angle = f * (-1.05 + t * 1.6);
+      } else {
+        angle = f * (-1.05);
+      }
+      ctx.save();
+      ctx.translate(pivotX, pivotY);
+      ctx.rotate(angle);
+      for (let wi=0; wi<wChars.length; wi++) {
+        const wx = f===1 ? wi*sz : -(wi+1)*sz;
+        atlas.draw(ctx, wChars[wi].c, sz, fc||wChars[wi].col, wx, -sz/2, hurtAlpha);
+      }
+      ctx.restore();
+    } else if (isSpear) {
+      let angle = 0;
+      let thrustOff = 0;
+      if (attacking) {
+        const t = 1 - player.attackTimer / 0.2;
+        angle = f * (0.5 - t * 0.85);
+        thrustOff = f * Math.sin(t * Math.PI) * 8;
+      }
+      ctx.save();
+      ctx.translate(pivotX + thrustOff, pivotY);
+      ctx.rotate(angle);
+      for (let wi=0; wi<wChars.length; wi++) {
+        const wx = f===1 ? wi*sz : -(wi+1)*sz;
+        atlas.draw(ctx, wChars[wi].c, sz, fc||wChars[wi].col, wx, -sz/2, hurtAlpha);
+      }
+      ctx.restore();
+    } else {
+      if (f===1) {
+        for (let wi=0; wi<wChars.length; wi++) {
+          atlas.draw(ctx, wChars[wi].c, sz, fc||wChars[wi].col, cx+sz/2+sz+wi*sz+atkOff, bodyY, hurtAlpha);
+        }
+      } else {
+        for (let wi=0; wi<wChars.length; wi++) {
+          atlas.draw(ctx, wChars[wi].c, sz, fc||wChars[wi].col, cx-sz/2-sz-(wi+1)*sz+atkOff, bodyY, hurtAlpha);
+        }
+      }
+    }
+  }
+
+  // Feet
+  const footY = bodyY + sz*2;
+  const footChar = player.shoes ? '鞋' : '脚';
+  const footCol = player.shoes ? '#E91E63' : '#4E342E';
+  atlas.draw(ctx, footChar, sz, fc||footCol, cx-sz+legOff, footY, hurtAlpha);
+  atlas.draw(ctx, footChar, sz, fc||footCol, cx-legOff, footY, hurtAlpha);
+}
+
+// =============================================================
+// SECTION 8: MONSTER SYSTEM
+// =============================================================
+let monsters = [];
+
+function createMonster(type, x, y) {
+  const base = {
+    type, x, y, vx:0, vy:0, w:28, h:32, hp:3, maxHp:3,
+    facing:1, dead:false, hurtTimer:0, aiTimer:0, aiState:'idle',
+    grounded:false, deathTimer:0, attackTimer:0,
+    burning:0, poisoned:0, stunned:0,
+    drops:[], patrolDir:1, patrolDist:0, maxPatrol:96,
+    projTimer:0, activated: false,
+  };
+  switch(type) {
+    case '魔':
+      Object.assign(base, {w:28,h:32,hp:3,maxHp:3,drops:['果'],dropChance:0.3});
+      break;
+    case '野猪':
+      Object.assign(base, {w:48,h:28,hp:5,maxHp:5,drops:['肉'],dropChance:0.5,speed:250});
+      break;
+    case '毒蛛':
+      Object.assign(base, {w:24,h:24,hp:2,maxHp:2,drops:['毒'],dropChance:0.2,projTimer:2});
+      break;
+    case '蝙蝠':
+      Object.assign(base, {w:28,h:20,hp:2,maxHp:2,drops:['果'],dropChance:0.3,flyY:y,flyAmp:40,flyInitY:y});
+      break;
+    case '火法师':
+      Object.assign(base, {w:32,h:40,hp:4,maxHp:4,drops:['火'],dropChance:0.5,projTimer:2});
+      break;
+    case '骷髅':
+      Object.assign(base, {w:28,h:36,hp:4,maxHp:4,drops:['盔'],dropChance:0.5,projTimer:2.5});
+      break;
+    case '巨石人':
+      Object.assign(base, {w:40,h:48,hp:10,maxHp:10,drops:['长'],dropChance:1.0,speed:45});
+      break;
+    case '影':
+      Object.assign(base, {w:24,h:28,hp:1,maxHp:1,drops:['鞋'],dropChance:0.5,speed:200,noCollision:true});
+      break;
+    case '鬼将':
+      Object.assign(base, {w:32,h:40,hp:8,maxHp:8,drops:['丹'],dropChance:0.8,speed:100});
+      break;
+    case '火龙':
+      Object.assign(base, {w:48,h:40,hp:15,maxHp:15,drops:['火','血'],dropChance:1.0,flyY:y,flyAmp:30,flyInitY:y,phase:1,speed:60});
+      break;
+    case '魔王':
+      Object.assign(base, {w:48,h:56,hp:20,maxHp:20,drops:['血','鞋','盔'],dropChance:1.0,speed:100,phase:1});
+      break;
+    case '长蛇':
+      Object.assign(base, {w:40,h:16,hp:3,maxHp:3,drops:['长'],dropChance:0.3,speed:70});
+      break;
+    case '树妖':
+      Object.assign(base, {w:32,h:48,hp:6,maxHp:6,drops:['丹'],dropChance:0.2,projTimer:2.5});
+      break;
+    case '冰灵':
+      Object.assign(base, {w:24,h:24,hp:8,maxHp:8,drops:['霜'],dropChance:0.5,flyY:y,flyAmp:20,flyInitY:y,projTimer:1.8,noCollision:true});
+      break;
+    case '刺客':
+      Object.assign(base, {w:24,h:32,hp:3,maxHp:3,drops:['盔'],dropChance:0.3,speed:30});
+      break;
+    case '雷兽':
+      Object.assign(base, {w:52,h:44,hp:14,maxHp:14,drops:['丹'],dropChance:0.6,speed:60});
+      break;
+    case '熔炎魔':
+      Object.assign(base, {w:44,h:56,hp:16,maxHp:16,drops:['火'],dropChance:1.0,speed:35,projTimer:3});
+      break;
+    case '冥蟒':
+      Object.assign(base, {w:56,h:32,hp:13,maxHp:13,drops:['毒'],dropChance:1.0,flyY:y,flyAmp:50,flyInitY:y,projTimer:2.5,noCollision:true});
+      break;
+    case '古傀儡':
+      Object.assign(base, {w:48,h:60,hp:18,maxHp:18,drops:['甲'],dropChance:1.0,speed:30});
+      break;
+    case '魔龙':
+      Object.assign(base, {w:80,h:72,hp:30,maxHp:30,drops:['丹'],dropChance:1.0,speed:60,phase:1,
+        flyY:y,flyAmp:0,flyInitY:y,dragonState:'idle',dragonTimer:1.5,dragonCombo:0,
+        dragonFlying:false,dragonBaseY:y,dragonTargetX:0,dragonTargetY:0,
+        dragonDiveStartY:0,dragonBreathCount:0});
+      break;
+  }
+  return base;
+}
+
+function updateMonster(m, dt) {
+  if (m.dead) {
+    m.deathTimer -= dt;
+    return;
+  }
+  m.hurtTimer = Math.max(0, m.hurtTimer-dt);
+  m.attackTimer = Math.max(0, m.attackTimer-dt);
+  m.burning = Math.max(0, m.burning-dt);
+  m.poisoned = Math.max(0, m.poisoned-dt);
+  m.stunned = Math.max(0, m.stunned-dt);
+
+  if (m.burning > 0 && Math.random()<0.02) {
+    addParticle('燃', m.x+Math.random()*m.w, m.y, (Math.random()-0.5)*30, -40, '#FF5722', 12, 0.5);
+  }
+  if (m.poisoned > 0 && Math.random()<0.02) {
+    addParticle('毒', m.x+Math.random()*m.w, m.y, (Math.random()-0.5)*30, -40, '#4CAF50', 12, 0.5);
+  }
+  if (m.stunned > 0) {
+    addParticle('冻', m.x+m.w/2+Math.sin(Date.now()*0.01)*10, m.y-12, 0, 0, '#4FC3F7', 10, 0.1);
+    return;
+  }
+
+  const dist = Math.abs(m.x - player.x);
+  if (dist > GAME_W * 1.5) return;
+  m.activated = true;
+
+  m.aiTimer += dt;
+  switch(m.type) {
+    case '魔': aiPatrol(m, dt, 80, 80); break;
+    case '野猪': aiCharge(m, dt); break;
+    case '毒蛛': aiSpiderRanged(m, dt); break;
+    case '蝙蝠': aiFly(m, dt); break;
+    case '火法师': aiRanged(m, dt, '火球', '#FF5722'); break;
+    case '骷髅': aiSkeletonRanged(m, dt); break;
+    case '巨石人': aiSlow(m, dt); break;
+    case '影': aiShadow(m, dt); break;
+    case '鬼将': aiGhostGeneral(m, dt); break;  
+    case '火龙': aiFireDragonBoss(m, dt); break;
+    case '魔王': aiBoss(m, dt); break;
+    case '魔龙': aiDragonBoss(m, dt); break;
+    case '长蛇': aiSnake(m, dt); break;
+    case '树妖': aiTreeSpirit(m, dt); break;
+    case '冰灵': aiIceSpirit(m, dt); break;
+    case '刺客': aiAssassin(m, dt); break;
+    case '雷兽': aiThunderBeast(m, dt); break;
+    case '熔炎魔': aiLavaDemon(m, dt); break;
+    case '冥蟒': aiAbyssSerpent(m, dt); break;
+    case '古傀儡': aiAncientGolem(m, dt); break;
+    default: aiPatrol(m, dt, 80, 80);
+  }
+
+  // Gravity for grounded types
+  if (m.type !== '蝙蝠' && m.type !== '火龙' && !m.noCollision && !(m.type==='魔龙'&&m.dragonFlying)) {
+    m.vy += GRAVITY * dt;
+    if (m.vy > MAX_FALL) m.vy = MAX_FALL;
+  }
+  m.x += m.vx * dt;
+  if (!m.noCollision) resolveCollisionX(m);
+  m.y += m.vy * dt;
+  m.grounded = false;
+  if (!m.noCollision) resolveCollisionY(m);
+
+  // Safety: kill monsters that go out of bounds or have NaN positions
+  if (isNaN(m.x)||isNaN(m.y)||m.x<-200||m.x>levelW*TILE+200||m.y>levelH*TILE+200) {
+    m.dead=true; m.deathTimer=0; return;
+  }
+
+  // Contact damage
+  if (!player.dead && player.hurtTimer <= 0 && aabbHit(m.x,m.y,m.w,m.h, player.x,player.y,player.w,player.h)) {
+    hurtPlayer(1);
+  }
+}
+
+// AI behaviors
+function aiPatrol(m, dt, speed, maxD) {
+  m.patrolDist += Math.abs(m.vx*dt);
+  if (m.patrolDist > maxD) { m.patrolDir *= -1; m.patrolDist = 0; }
+  m.vx = speed * m.patrolDir;
+  m.facing = m.patrolDir;
+}
+
+function aiCharge(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  const inRange = dist < 200 && Math.abs(player.y - m.y) < 50;
+  if (!m.chargeState) m.chargeState = 'idle';
+  if (!m.chargeTimer) m.chargeTimer = 0;
+  m.chargeTimer -= dt;
+
+  switch (m.chargeState) {
+    case 'idle':
+      if (inRange) {
+        m.chargeState = 'charge';
+        m.chargeFacing = dx > 0 ? 1 : -1;
+        m.chargeTimer = 0.8;
+      } else {
+        aiPatrol(m, dt, 60, 80);
+      }
+      break;
+    case 'charge':
+      m.vx = m.chargeFacing * (m.speed || 250);
+      m.facing = m.chargeFacing;
+      if (m.chargeTimer <= 0 || (dist < 20 && inRange)) {
+        m.chargeState = 'retreat';
+        m.chargeTimer = 0.5;
+      }
+      break;
+    case 'retreat':
+      m.vx = -m.chargeFacing * (m.speed || 250) * 0.6;
+      m.facing = m.chargeFacing;
+      if (m.chargeTimer <= 0) {
+        m.chargeState = 'charge';
+        m.chargeFacing = (player.x - m.x) > 0 ? 1 : -1;
+        m.chargeTimer = 0.8;
+      }
+      break;
+  }
+  if (!inRange && dist > 250 && m.chargeState !== 'idle') {
+    m.chargeState = 'idle';
+    m.chargeTimer = 0;
+  }
+}
+
+function aiDropAttack(m, dt) {
+  if (m.aiState === 'idle') {
+    m.vx = 0;
+    if (Math.abs(player.x-m.x)<40 && player.y > m.y) { m.aiState='drop'; m.vy=0; }
+  } else if (m.aiState === 'drop') {
+    m.vy = 150;
+    if (m.grounded) { m.aiState='crawl'; m.aiTimer=0; }
+  } else {
+    aiPatrol(m, dt, 50, 60);
+    if (m.aiTimer > 3) { m.aiState='idle'; m.aiTimer=0; }
+  }
+}
+
+// Spider AI: patrols and spits poison webs
+function aiSpiderRanged(m, dt) {
+  aiPatrol(m, dt, 50, 60);
+  const dx = player.x - m.x;
+  m.facing = dx > 0 ? 1 : -1;
+  m.projTimer = (m.projTimer || 2) - dt;
+  if (m.projTimer <= 0 && Math.abs(dx) < 200) {
+    m.projTimer = 2.2;
+    // Spit poison web in arc toward player
+    const dist = Math.abs(dx);
+    const throwVx = m.facing * (60 + Math.min(dist * 0.4, 100));
+    const throwVy = -120 - Math.random() * 30;
+    spawnArcProjectile(m.x + m.w/2, m.y + 4, throwVx, throwVy, '毒', '#4CAF50', 1);
+    addParticle('丝', m.x + m.w/2, m.y, m.facing * 10, -20, '#8BC34A', 10, 0.3);
+  }
+}
+
+// FIXED: Bat AI - store initial Y on creation, use stable patrol
+function aiFly(m, dt) {
+  // Use the stored flyInitY which is set at creation time
+  const homeY = m.flyInitY;
+  if (!m.flyDir) m.flyDir = 1;
+  if (!m.flyDist) m.flyDist = 0;
+  const maxFlyDist = 100;
+  const flySpeed = 50;
+
+  // Horizontal patrol
+  m.flyDist += flySpeed * dt;
+  if (m.flyDist > maxFlyDist) {
+    m.flyDir *= -1;
+    m.flyDist = 0;
+  }
+  m.vx = flySpeed * m.flyDir;
+  m.facing = m.flyDir;
+
+  // Gentle vertical bobbing around home Y (stable, no drift)
+  m.y = homeY + Math.sin(m.aiTimer * 1.5) * (m.flyAmp || 25);
+  m.vy = 0;
+
+  // If player is close, drift toward them slowly
+  const dx = player.x - m.x;
+  if (Math.abs(dx) < 120 && Math.abs(player.y - m.y) < 80) {
+    m.vx = (dx > 0 ? 1 : -1) * 70;
+    m.facing = dx > 0 ? 1 : -1;
+  }
+}
+
+function aiRanged(m, dt, projChar, projCol) {
+  m.vx = 0;
+  const dx = player.x - m.x;
+  m.facing = dx > 0 ? 1 : -1;
+  m.projTimer = (m.projTimer||0) - dt;
+  if (m.projTimer <= 0 && Math.abs(dx) < 250) {
+    m.projTimer = 2;
+    spawnProjectile(m.x+m.w/2, m.y+m.h/2, m.facing*180, 0, projChar, projCol, 1);
+  }
+}
+
+// Skeleton: throws bones in parabolic arc
+function aiSkeletonRanged(m, dt) {
+  m.vx = 0;
+  const dx = player.x - m.x;
+  m.facing = dx > 0 ? 1 : -1;
+  m.projTimer = (m.projTimer||0) - dt;
+  if (m.projTimer <= 0 && Math.abs(dx) < 280) {
+    m.projTimer = 2.2;
+    // Calculate arc: throw bone upward so it arcs down toward player
+    const throwVx = m.facing * (80 + Math.min(Math.abs(dx)*0.4, 120));
+    const throwVy = -180 - Math.random()*40;
+    spawnArcProjectile(m.x+m.w/2, m.y+8, throwVx, throwVy, '骨', '#ECEFF1', 1);
+  }
+}
+
+// Arc projectile: affected by gravity
+function spawnArcProjectile(x,y,vx,vy,c,col,dmg) {
+  if (projectiles.length > 80) projectiles.splice(0, 20);
+  projectiles.push({x,y,vx,vy,c,col,dmg,w:12,h:12,life:3,fromPlayer:false,hasGravity:true});
+}
+
+// Snake AI: slithers on ground, lunges at player
+function aiSnake(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  const dy = Math.abs(player.y - m.y);
+  m.facing = dx>0?1:-1;
+
+  if (!m.snakeState) m.snakeState = 'slither';
+  if (!m.snakeTimer) m.snakeTimer = 0;
+  m.snakeTimer -= dt;
+
+  switch(m.snakeState) {
+    case 'slither':
+      // Wavy movement toward player
+      m.vx = m.facing * 70;
+      if (dist < 50 && dy < 30) {
+        m.snakeState = 'coil';
+        m.snakeTimer = 0.4;
+        m.vx = 0;
+      }
+      if (dist > 200) {
+        aiPatrol(m, dt, 50, 80);
+      }
+      break;
+    case 'coil':
+      m.vx = 0;
+      if (m.snakeTimer <= 0) {
+        m.snakeState = 'lunge';
+        m.snakeTimer = 0.2;
+        m.vx = m.facing * 300;
+        m.vy = -80;
+      }
+      break;
+    case 'lunge':
+      if (!player.dead && aabbHit(m.x,m.y,m.w,m.h,player.x,player.y,player.w,player.h)) {
+        hurtPlayer(1);
+      }
+      if (m.snakeTimer <= 0 || m.grounded) {
+        m.snakeState = 'rest';
+        m.snakeTimer = 0.8;
+        m.vx = 0;
+      }
+      break;
+    case 'rest':
+      m.vx *= 0.9;
+      if (m.snakeTimer <= 0) {
+        m.snakeState = 'slither';
+      }
+      break;
+  }
+}
+
+// Tree Spirit: stationary, spawns leaf projectiles in pattern
+function aiTreeSpirit(m, dt) {
+  m.vx = 0;
+  const dx = player.x - m.x;
+  m.facing = dx > 0 ? 1 : -1;
+  m.projTimer = (m.projTimer||0) - dt;
+  if (m.projTimer <= 0 && Math.abs(dx) < 220) {
+    m.projTimer = 2.5;
+    const dist = Math.abs(dx);
+    // Arc toward player: horizontal speed scales with distance, upward launch with gravity
+    for (let i = -1; i <= 1; i++) {
+      const throwVx = m.facing * (50 + Math.min(dist * 0.5, 120)) + i * 20;
+      const throwVy = -140 - Math.random() * 30;
+      projectiles.push({x: m.x+m.w/2, y: m.y+10, vx: throwVx, vy: throwVy, c:'叶', col:'#4CAF50', dmg:1, w:12, h:12, life:2.5, fromPlayer:false, hasGravity:true});
+    }
+    addParticle('叶', m.x+m.w/2, m.y, 0, -30, '#4CAF50', 14, 0.4);
+  }
+}
+
+// Ice Spirit: floats, creates ice hazard, fires ice shards
+function aiIceSpirit(m, dt) {
+  const homeY = m.flyInitY || m.y;
+  m.y = homeY + Math.sin(m.aiTimer * 2) * 20;
+  m.vy = 0;
+  const dx = player.x - m.x;
+  m.facing = dx > 0 ? 1 : -1;
+  // Gentle drift
+  m.vx = Math.sin(m.aiTimer * 0.8) * 40;
+  m.projTimer = (m.projTimer||0) - dt;
+  if (m.projTimer <= 0 && Math.abs(dx) < 200) {
+    m.projTimer = 1.8;
+    // Ice shard - faster, straight line
+    spawnProjectile(m.x+m.w/2, m.y+m.h/2, m.facing * 200, 0, '冰', '#4FC3F7', 1);
+    addParticle('冰', m.x+m.w/2, m.y+m.h/2, m.facing*10, 0, '#B3E5FC', 10, 0.3);
+  }
+}
+
+// Assassin: invisible until close, backstab attack
+function aiAssassin(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  const dy = Math.abs(player.y - m.y);
+  m.facing = dx>0?1:-1;
+
+  if (!m.assState) m.assState = 'hide';
+  if (!m.assTimer) m.assTimer = 0;
+  m.assTimer -= dt;
+  // visibility for rendering
+  m.assVisible = m.assState !== 'hide';
+
+  switch(m.assState) {
+    case 'hide':
+      m.vx = 0;
+      // Approach slowly when far, invisible
+      if (dist > 60) {
+        m.vx = m.facing * 30;
+      }
+      // Strike when close
+      if (dist < 50 && dy < 40) {
+        m.assState = 'strike';
+        m.assTimer = 0.15;
+        m.vx = m.facing * 280;
+        addParticle('闪', m.x+m.w/2, m.y+m.h/2, 0, -20, '#3F51B5', 16, 0.3);
+      }
+      break;
+    case 'strike':
+      if (!player.dead && aabbHit(m.x,m.y,m.w,m.h,player.x,player.y,player.w,player.h)) {
+        hurtPlayer(2);
+        cam.shake(4, 0.15);
+      }
+      if (m.assTimer <= 0) {
+        m.assState = 'flee';
+        m.assTimer = 1.0;
+        m.vx = -m.facing * 180;
+      }
+      break;
+    case 'flee':
+      if (m.assTimer <= 0) {
+        m.assState = 'hide';
+        m.assTimer = 2.0;
+      }
+      m.vx *= 0.95;
+      break;
+  }
+}
+
+// =============================================================
+// LARGE ELITE MONSTERS
+// =============================================================
+
+// Thunder Beast: charge with lightning trail + AoE stomp + chain lightning
+function aiThunderBeast(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  const dy = Math.abs(player.y - m.y);
+  m.facing = dx>0?1:-1;
+
+  if (!m.tbState) m.tbState = 'prowl';
+  if (m.tbTimer === undefined) m.tbTimer = 1.5;
+  m.tbTimer -= dt;
+
+  switch(m.tbState) {
+    case 'prowl':
+      // Slow menacing walk toward player
+      if (dist > 40) m.vx = m.facing * (m.speed||60);
+      else m.vx = 0;
+      // Sparks while prowling
+      if (Math.random()<0.04) addParticle('电',m.x+Math.random()*m.w,m.y,(Math.random()-0.5)*20,-20,'#FFD600',10,0.3);
+      if (m.tbTimer <= 0) {
+        // Pick attack based on distance
+        if (dist < 70 && dy < 50) {
+          m.tbState = 'stomp_windup';
+          m.tbTimer = 0.6;
+          m.vx = 0;
+        } else if (dist < 250) {
+          m.tbState = 'charge_windup';
+          m.tbTimer = 0.5;
+          m.vx = 0;
+          m.tbChargeFace = m.facing;
+        } else {
+          m.tbState = 'lightning';
+          m.tbTimer = 0.8;
+          m.vx = 0;
+        }
+      }
+      break;
+
+    case 'charge_windup':
+      m.vx = 0;
+      // Electricity gathers, body shakes
+      if (Math.random()<0.25) addParticle('电',m.x+m.w/2+(Math.random()-0.5)*20,m.y+m.h/2,(Math.random()-0.5)*40,(Math.random()-0.5)*30,'#FFD600',12,0.2);
+      if (m.tbTimer <= 0) {
+        m.tbState = 'charge';
+        m.tbTimer = 0.6;
+      }
+      break;
+
+    case 'charge':
+      m.vx = m.tbChargeFace * 320;
+      // Lightning trail
+      if (Math.random()<0.3) addParticle('电',m.x+m.w/2-m.tbChargeFace*20,m.y+m.h,(Math.random()-0.5)*10,-15,'#FFD600',14,0.4);
+      // Contact damage
+      if (!player.dead && player.hurtTimer<=0 && aabbHit(m.x-8,m.y,m.w+16,m.h,player.x,player.y,player.w,player.h)) {
+        hurtPlayer(2);
+        cam.shake(5,0.2);
+      }
+      if (m.tbTimer <= 0) {
+        m.tbState = 'charge_recover';
+        m.tbTimer = 0.8;
+        m.vx = 0;
+      }
+      break;
+
+    case 'charge_recover':
+      m.vx *= 0.85;
+      if (m.tbTimer <= 0) { m.tbState = 'prowl'; m.tbTimer = 1.2; }
+      break;
+
+    case 'stomp_windup':
+      m.vx = 0;
+      // Raise up before stomp
+      if (Math.random()<0.2) addParticle('电',m.x+m.w/2,m.y-5,0,-30,'#FFD600',16,0.3);
+      if (m.tbTimer <= 0) {
+        m.tbState = 'stomp';
+        m.tbTimer = 0.2;
+        cam.shake(8,0.35);
+        // AoE ground shockwave
+        if (dist < 90 && dy < 60) hurtPlayer(3);
+        for (let i=-2;i<=2;i++) {
+          addParticle('震',m.x+m.w/2+i*20,m.y+m.h,i*30,-30-Math.random()*20,'#FDD835',18,0.5,100);
+        }
+        addParticle('电',m.x+m.w/2,m.y+m.h,0,-50,'#FFD600',22,0.6);
+      }
+      break;
+
+    case 'stomp':
+      m.vx = 0;
+      if (m.tbTimer <= 0) { m.tbState = 'prowl'; m.tbTimer = 1.5; }
+      break;
+
+    case 'lightning':
+      m.vx = 0;
+      // Shoot chain lightning toward player
+      if (m.tbTimer < 0.4 && m.tbTimer > 0.3) {
+        const spd = 220;
+        spawnProjectile(m.x+m.w/2, m.y+m.h/4, m.facing*spd, -30, '电', '#FFD600', 2);
+        spawnProjectile(m.x+m.w/2, m.y+m.h/4, m.facing*spd*0.8, -60, '电', '#FDD835', 1);
+        addParticle('电',m.x+m.w/2,m.y+m.h/4,m.facing*40,0,'#FFD600',16,0.3);
+      }
+      if (m.tbTimer <= 0) { m.tbState = 'prowl'; m.tbTimer = 1.0; }
+      break;
+  }
+}
+
+// Lava Demon: leaves fire pools, erupts magma rain, slow heavy punches
+function aiLavaDemon(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  const dy = Math.abs(player.y - m.y);
+  m.facing = dx>0?1:-1;
+
+  if (!m.ldState) m.ldState = 'walk';
+  if (m.ldTimer === undefined) m.ldTimer = 2.0;
+  if (m.firePoolTimer === undefined) m.firePoolTimer = 0;
+  m.ldTimer -= dt;
+  m.firePoolTimer -= dt;
+
+  // Passive: leave fire trail while walking
+  if ((m.ldState === 'walk' || m.ldState === 'advance') && m.firePoolTimer <= 0) {
+    m.firePoolTimer = 1.2;
+    spawnProjectile(m.x+m.w/2, m.y+m.h-6, 0, 0, '焰', '#FF3D00', 1);
+    addParticle('焰',m.x+m.w/2,m.y+m.h,(Math.random()-0.5)*8,-15,'#FF6D00',10,0.4);
+  }
+
+  // Ambient lava drip
+  if (Math.random()<0.05) addParticle('焰',m.x+Math.random()*m.w,m.y+m.h,(Math.random()-0.5)*10,-8,'#FF3D00',8,0.6,50);
+
+  switch(m.ldState) {
+    case 'walk':
+      if (dist > 200) m.vx = m.facing * (m.speed||35);
+      else m.vx = 0;
+      if (m.ldTimer <= 0) {
+        if (dist < 70 && dy < 50) {
+          m.ldState = 'punch_windup';
+          m.ldTimer = 0.6;
+        } else if (dist < 250) {
+          m.ldState = 'advance';
+          m.ldTimer = 1.5;
+        } else {
+          m.ldState = 'eruption_charge';
+          m.ldTimer = 1.0;
+        }
+        m.vx = 0;
+      }
+      break;
+
+    case 'advance':
+      m.vx = m.facing * (m.speed||35) * 2;
+      if (dist < 60 && dy < 50) {
+        m.ldState = 'punch_windup';
+        m.ldTimer = 0.6;
+        m.vx = 0;
+      }
+      if (m.ldTimer <= 0) { m.ldState = 'walk'; m.ldTimer = 1.5; m.vx = 0; }
+      break;
+
+    case 'punch_windup':
+      m.vx = 0;
+      // Arm glows
+      if (Math.random()<0.2) addParticle('焰',m.x+m.facing*m.w,m.y+m.h/2,(Math.random()-0.5)*15,-10,'#FF6D00',14,0.3);
+      if (m.ldTimer <= 0) {
+        m.ldState = 'punch';
+        m.ldTimer = 0.2;
+        cam.shake(5,0.2);
+        if (dist < 75 && dy < 55) hurtPlayer(2);
+        addParticle('焰',m.x+m.facing*m.w,m.y+m.h/2,m.facing*60,-20,'#FF3D00',20,0.4);
+      }
+      break;
+
+    case 'punch':
+      m.vx = m.facing * 50;
+      if (m.ldTimer <= 0) { m.ldState = 'walk'; m.ldTimer = 2.0; m.vx = 0; }
+      break;
+
+    case 'eruption_charge':
+      m.vx = 0;
+      // Build up magma
+      if (Math.random()<0.3) addParticle('焰',m.x+m.w/2+(Math.random()-0.5)*20,m.y,(Math.random()-0.5)*30,-40,'#FF6D00',14,0.4);
+      if (m.ldTimer <= 0) {
+        m.ldState = 'eruption';
+        m.ldTimer = 0.3;
+        cam.shake(6,0.25);
+        // Rain magma in area around player
+        for (let i=0;i<5;i++) {
+          const tx = player.x + (Math.random()-0.5)*160;
+          spawnArcProjectile(tx, player.y-200-Math.random()*60, (Math.random()-0.5)*20, 40+Math.random()*30, '焰', '#FF3D00', 1);
+        }
+      }
+      break;
+
+    case 'eruption':
+      m.vx = 0;
+      if (m.ldTimer <= 0) { m.ldState = 'walk'; m.ldTimer = 2.5; }
+      break;
+  }
+}
+
+// Abyss Serpent: figure-8 flight, sweeping poison breath, dive attack
+function aiAbyssSerpent(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  m.facing = dx>0?1:-1;
+  const homeY = m.flyInitY;
+
+  if (!m.asState) m.asState = 'fly';
+  if (m.asTimer === undefined) m.asTimer = 3.0;
+  m.asTimer -= dt;
+
+  switch(m.asState) {
+    case 'fly':
+      // Figure-8 flight pattern via velocity only
+      m.vx = Math.cos(m.aiTimer * 1.2) * 80;
+      m.y = homeY + Math.sin(m.aiTimer * 2.4) * (m.flyAmp||50);
+      m.vy = 0;
+      // Ambient poison drip
+      if (Math.random()<0.04) addParticle('毒',m.x+Math.random()*m.w,m.y+m.h,(Math.random()-0.5)*8,10,'#CE93D8',8,0.5,30);
+      if (m.asTimer <= 0) {
+        if (dist < 200 && Math.random()<0.5) {
+          m.asState = 'breath_charge';
+          m.asTimer = 0.6;
+        } else if (dist < 300) {
+          m.asState = 'dive_aim';
+          m.asTimer = 0.5;
+          m.diveTargetX = player.x;
+          m.diveTargetY = player.y;
+        } else {
+          m.asTimer = 2.0;
+        }
+      }
+      break;
+
+    case 'breath_charge':
+      // Hover and charge poison
+      m.vx = 0;
+      m.y = homeY + Math.sin(m.aiTimer * 3) * 10;
+      if (Math.random()<0.25) addParticle('息',m.x+m.w/2+m.facing*10,m.y+m.h/2,m.facing*15,0,'#CE93D8',12,0.3);
+      if (m.asTimer <= 0) {
+        m.asState = 'breath';
+        m.asTimer = 0.8;
+      }
+      break;
+
+    case 'breath':
+      m.vx = 0;
+      // Spray poison projectiles in a sweeping arc
+      if (Math.random()<0.2) {
+        const angle = (m.asTimer-0.4)*2 + (Math.random()-0.5)*0.3;
+        const spd = 160;
+        spawnProjectile(m.x+m.w/2, m.y+m.h/2, m.facing*spd*Math.cos(angle), spd*Math.sin(angle), '息', '#CE93D8', 1);
+      }
+      if (m.asTimer <= 0) {
+        m.asState = 'fly';
+        m.asTimer = 2.5;
+      }
+      break;
+
+    case 'dive_aim':
+      m.vx = 0;
+      // Flash eyes to telegraph
+      if (Math.random()<0.2) addParticle('冥',m.x+m.w/2,m.y+m.h/2,0,0,'#7B1FA2',16,0.2);
+      if (m.asTimer <= 0) {
+        m.asState = 'dive';
+        m.asTimer = 0.4;
+        // Calculate dive vector
+        const tdx = m.diveTargetX - m.x;
+        const tdy = m.diveTargetY - m.y;
+        const len = Math.sqrt(tdx*tdx+tdy*tdy) || 1;
+        m.vx = tdx/len * 350;
+        m.vy = tdy/len * 350;
+      }
+      break;
+
+    case 'dive':
+      // Hurtle toward target, damaging on contact
+      if (!player.dead && player.hurtTimer<=0 && aabbHit(m.x-5,m.y-5,m.w+10,m.h+10,player.x,player.y,player.w,player.h)) {
+        hurtPlayer(2);
+        cam.shake(5,0.2);
+      }
+      // Trail
+      if (Math.random()<0.3) addParticle('冥',m.x+m.w/2,m.y+m.h/2,(Math.random()-0.5)*20,(Math.random()-0.5)*20,'#4A148C',14,0.3);
+      if (m.asTimer <= 0) {
+        m.asState = 'dive_recover';
+        m.asTimer = 1.0;
+        m.vx = 0; m.vy = 0;
+      }
+      break;
+
+    case 'dive_recover':
+      // Float back to home altitude
+      m.vx *= 0.9;
+      const targetY = homeY;
+      m.y += (targetY - m.y) * dt * 3;
+      m.vy = 0;
+      if (m.asTimer <= 0) {
+        m.asState = 'fly';
+        m.asTimer = 2.0;
+      }
+      break;
+  }
+}
+
+// Ancient Golem: shield phase, punch combo, ground laser
+function aiAncientGolem(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  const dy = Math.abs(player.y - m.y);
+  m.facing = dx>0?1:-1;
+
+  if (!m.agState) m.agState = 'guard';
+  if (m.agTimer === undefined) m.agTimer = 2.0;
+  if (m.shielded === undefined) m.shielded = true;
+  if (m.comboStep === undefined) m.comboStep = 0;
+  m.agTimer -= dt;
+
+  switch(m.agState) {
+    case 'guard':
+      m.vx = 0;
+      m.shielded = true;
+      // Stand and block - takes half damage (handled in hurtMonster)
+      if (Math.random()<0.03) addParticle('盾',m.x+m.w/2,m.y+m.h/2,(Math.random()-0.5)*10,0,'#8D6E63',12,0.4);
+      if (m.agTimer <= 0) {
+        if (dist < 180) {
+          m.agState = 'advance';
+          m.agTimer = 1.5;
+          m.shielded = false;
+        } else {
+          m.agState = 'laser_charge';
+          m.agTimer = 0.8;
+          m.shielded = false;
+        }
+      }
+      break;
+
+    case 'advance':
+      m.shielded = false;
+      m.vx = m.facing * (m.speed||30) * 2.5;
+      if (dist < 55 && dy < 50) {
+        m.agState = 'punch';
+        m.agTimer = 0.3;
+        m.comboStep = 0;
+        m.vx = 0;
+      }
+      if (m.agTimer <= 0) { m.agState = 'guard'; m.agTimer = 2.0; m.vx = 0; }
+      break;
+
+    case 'punch':
+      m.vx = 0;
+      m.shielded = false;
+      if (m.agTimer <= 0) {
+        // Execute punch
+        cam.shake(4,0.15);
+        if (dist < 65 && dy < 55) hurtPlayer(2);
+        addParticle('震',m.x+m.facing*m.w,m.y+m.h/2,m.facing*50,0,'#5D4037',18,0.3);
+        m.comboStep++;
+        if (m.comboStep < 3) {
+          // Continue combo
+          m.agTimer = 0.35;
+          m.vx = m.facing * 40;
+        } else {
+          // Combo finished, uppercut
+          m.agState = 'uppercut';
+          m.agTimer = 0.4;
+          cam.shake(6,0.25);
+          if (dist < 70 && dy < 60) {
+            hurtPlayer(3);
+          }
+          addParticle('震',m.x+m.facing*m.w,m.y,m.facing*30,-80,'#5D4037',22,0.5);
+          addParticle('震',m.x+m.facing*m.w,m.y+20,m.facing*50,-40,'#8D6E63',16,0.4);
+        }
+      }
+      break;
+
+    case 'uppercut':
+      m.vx = 0;
+      if (m.agTimer <= 0) { m.agState = 'guard'; m.agTimer = 2.5; m.comboStep = 0; }
+      break;
+
+    case 'laser_charge':
+      m.vx = 0;
+      m.shielded = false;
+      // Eyes glow
+      if (Math.random()<0.3) addParticle('光',m.x+m.w/2,m.y+10,(Math.random()-0.5)*5,-5,'#FF6D00',10,0.2);
+      if (m.agTimer <= 0) {
+        m.agState = 'laser';
+        m.agTimer = 0.5;
+        m.laserCount = 0;
+        m.laserInterval = 0;
+        m.laserFace = m.facing;
+        m.laserX = m.x;
+        m.laserY = m.y;
+        cam.shake(4,0.3);
+      }
+      break;
+
+    case 'laser':
+      m.vx = 0;
+      m.laserInterval -= dt;
+      if (m.laserInterval <= 0 && m.laserCount < 5) {
+        m.laserCount++;
+        m.laserInterval = 0.08;
+        const px = m.laserX + m.laserFace * m.laserCount * 35;
+        spawnProjectile(px, m.laserY+m.h/2, m.laserFace*20, 0, '光', '#FF6D00', 2);
+        addParticle('光',px,m.laserY+m.h/2,0,-15,'#FFD600',12,0.3);
+      }
+      if (m.agTimer <= 0) { m.agState = 'guard'; m.agTimer = 2.0; }
+      break;
+  }
+}
+
+function aiSlow(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  m.facing = dx>0?1:-1;
+  if (!m.slamState) m.slamState = 'walk';
+  if (!m.slamTimer) m.slamTimer = 0;
+  m.slamTimer -= dt;
+
+  switch(m.slamState) {
+    case 'walk':
+      if (dist < 150) {
+        m.vx = m.facing * (m.speed||45);
+      } else { m.vx = 0; }
+      if (dist < 55 && Math.abs(player.y-m.y)<50) {
+        m.slamState = 'windup';
+        m.slamTimer = 0.7;
+        m.vx = 0;
+      }
+      break;
+    case 'windup':
+      m.vx = 0;
+      // Shake to telegraph
+      if (Math.random()<0.15) addParticle('震', m.x+m.w/2+(Math.random()-0.5)*10, m.y+m.h, 0, -10, '#9E9E9E', 12, 0.3);
+      if (m.slamTimer <= 0) {
+        m.slamState = 'slam';
+        m.slamTimer = 0.15;
+        cam.shake(6, 0.3);
+        addParticle('震', m.x+m.w/2, m.y+m.h, 0, 0, '#9E9E9E', 24, 0.5);
+        addParticle('震', m.x+m.w/2-20, m.y+m.h, -30, -20, '#9E9E9E', 16, 0.4);
+        addParticle('震', m.x+m.w/2+20, m.y+m.h, 30, -20, '#9E9E9E', 16, 0.4);
+      }
+      break;
+    case 'slam':
+      m.vx = 0;
+      if (dist < 65 && Math.abs(player.y-m.y)<50) hurtPlayer(2);
+      if (m.slamTimer <= 0) {
+        m.slamState = 'recover';
+        m.slamTimer = 1.0;
+      }
+      break;
+    case 'recover':
+      m.vx = 0;
+      if (m.slamTimer <= 0) {
+        m.slamState = 'walk';
+      }
+      break;
+  }
+}
+
+function aiShadow(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  const dy = Math.abs(player.y - m.y);
+  m.facing = dx>0?1:-1;
+
+  if (!m.shadowState) m.shadowState = 'stalk';
+  if (!m.shadowTimer) m.shadowTimer = 0;
+  m.shadowTimer -= dt;
+
+  switch(m.shadowState) {
+    case 'stalk':
+      // Float toward player slowly
+      if (dist > 60) {
+        m.vx = m.facing * 60;
+      } else {
+        m.vx *= 0.8;
+      }
+      // Drift vertically toward player
+      if (player.y < m.y - 10) m.vy = -50;
+      else if (player.y > m.y + 10) m.vy = 50;
+      else m.vy *= 0.8;
+      // If close enough, prepare to dash
+      if (dist < 140 && dy < 80 && m.shadowTimer <= 0) {
+        m.shadowState = 'aim';
+        m.shadowTimer = 0.5;
+        m.vx = 0; m.vy = 0;
+        m.dashDx = dx > 0 ? 1 : -1;
+      }
+      break;
+    case 'aim':
+      m.vx = 0; m.vy = 0;
+      // Flicker to telegraph
+      if (Math.random()<0.15) addParticle('影', m.x+m.w/2, m.y+m.h/2, (Math.random()-0.5)*40, (Math.random()-0.5)*40, '#444', 10, 0.2);
+      if (m.shadowTimer <= 0) {
+        m.shadowState = 'dash';
+        m.shadowTimer = 0.25;
+        m.vx = m.dashDx * 350;
+      }
+      break;
+    case 'dash':
+      // Keep dashing, deal damage on contact
+      if (m.shadowTimer <= 0) {
+        m.shadowState = 'recover';
+        m.shadowTimer = 0.8;
+        m.vx = 0; m.vy = 0;
+      }
+      break;
+    case 'recover':
+      m.vx *= 0.9;
+      m.vy *= 0.9;
+      if (m.shadowTimer <= 0) {
+        m.shadowState = 'stalk';
+        m.shadowTimer = 0.5;
+      }
+      break;
+  }
+}
+
+// Ghost General AI - summons shadows, retreats and commands
+function aiGhostGeneral(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  const dy = Math.abs(player.y - m.y);
+  m.facing = dx > 0 ? 1 : -1;
+
+  if (!m.ghostState) m.ghostState = 'patrol';
+  if (!m.ghostTimer) m.ghostTimer = 0;
+  if (!m.summonCount) m.summonCount = 0;
+  m.ghostTimer -= dt;
+
+  switch(m.ghostState) {
+    case 'patrol':
+      aiPatrol(m, dt, m.speed || 80, 100);
+      if (dist < 200 && dy < 80) {
+        m.ghostState = 'summon';
+        m.ghostTimer = 0.8;
+        m.vx = 0;
+      }
+      break;
+    case 'summon':
+      m.vx = 0;
+      // Telegraph with particles
+      if (Math.random()<0.2) addParticle('影', m.x+m.w/2, m.y, (Math.random()-0.5)*40, -30, '#3F51B5', 14, 0.4);
+      if (m.ghostTimer <= 0) {
+        // Summon 1-2 shadows nearby
+        const count = m.summonCount < 2 ? 2 : 1;
+        for (let i=0; i<count; i++) {
+          const sx = m.x + (Math.random()-0.5)*80;
+          const sy = m.y - 20;
+          if (monsters.length < 12) {
+            monsters.push(createMonster('影', sx, sy));
+            addParticle('影', sx+12, sy+14, 0, -40, '#444', 18, 0.5);
+          }
+        }
+        m.summonCount++;
+        cam.shake(3, 0.15);
+        m.ghostState = 'retreat';
+        m.ghostTimer = 1.2;
+      }
+      break;
+    case 'retreat':
+      // Move away from player
+      m.vx = -m.facing * (m.speed || 80) * 1.2;
+      if (m.ghostTimer <= 0) {
+        m.ghostState = 'chase';
+        m.ghostTimer = 2.0;
+      }
+      break;
+    case 'chase':
+      m.vx = m.facing * (m.speed || 80);
+      // Occasional melee swing if very close
+      if (dist < 40 && dy < 40 && m.ghostTimer < 1.0) {
+        hurtPlayer(2);
+        cam.shake(4, 0.15);
+        m.ghostTimer = 2.0;
+      }
+      if (m.ghostTimer <= 0) {
+        m.ghostState = 'summon';
+        m.ghostTimer = 0.8;
+        m.vx = 0;
+      }
+      if (dist > 280) {
+        m.ghostState = 'patrol';
+        m.patrolDist = 0;
+      }
+      break;
+  }
+}
+
+function aiFireDragonBoss(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  m.facing = dx > 0 ? 1 : -1;
+  const hpPct = m.hp / m.maxHp;
+  if (!m.phase) m.phase = 1;
+  if (hpPct < 0.6 && m.phase === 1) { m.phase = 2; cam.shake(6, 0.3); addParticle('怒', m.x+m.w/2, m.y-10, 0, -30, '#FF3D00', 20, 0.6); }
+  if (hpPct < 0.3 && m.phase === 2) { m.phase = 3; cam.shake(10, 0.4); addParticle('狂', m.x+m.w/2, m.y-10, 0, -30, '#FF1744', 24, 0.8); }
+
+  if (!m.fdState) m.fdState = 'hover';
+  if (m.fdTimer === undefined) m.fdTimer = 1.5;
+  m.fdTimer -= dt;
+
+  // Keep flying (override gravity)
+  const homeY = m.flyInitY || m.y;
+  if (m.fdState === 'hover' || m.fdState === 'recover') {
+    m.y = homeY + Math.sin(m.aiTimer * 1.2) * (m.flyAmp || 30);
+    m.vy = 0;
+  }
+
+  const pickAttack = () => {
+    // Module 1: flame attacks (all phases)
+    // Module 2: dive attacks (phase 2+)
+    // Module 3: rain of fire (phase 3, or sometimes phase 2)
+    const atks = ['flame_spread', 'flame_breath', 'swoop'];
+    if (m.phase >= 2) atks.push('dive_bomb', 'flame_wave');
+    if (m.phase >= 3) atks.push('fire_rain', 'fury_barrage');
+    return atks[Math.floor(Math.random() * atks.length)];
+  };
+
+  switch (m.fdState) {
+    case 'hover':
+      // Idle hovering, drift toward player
+      m.vx = m.facing * 40;
+      if (m.fdTimer <= 0) {
+        m.fdState = pickAttack();
+        m.fdTimer = 0.8;
+        m.vx = 0;
+      }
+      break;
+
+    // MODULE 1: Flame attacks
+    case 'flame_spread':
+      // Spread 3-5 fireballs in a fan pattern
+      m.vx = 0;
+      m.vy = 0;
+      if (m.fdTimer > 0.4) {
+        if (Math.random() < 0.2) addParticle('焰', m.x+m.w/2, m.y+m.h, m.facing*15, 10, '#FF5722', 14, 0.3);
+      } else if (m.fdTimer > 0.3) {
+        const count = m.phase >= 3 ? 5 : (m.phase >= 2 ? 4 : 3);
+        for (let i = 0; i < count; i++) {
+          const angle = (i - (count-1)/2) * 0.4;
+          const spd = 150 + m.phase * 20;
+          spawnProjectile(m.x+m.w/2, m.y+m.h, m.facing*spd*Math.cos(angle)+Math.sin(angle)*40, spd*Math.sin(angle)+60, '火', '#FF5722', 1);
+        }
+        cam.shake(3, 0.15);
+        m.fdTimer = 0.2;
+      }
+      if (m.fdTimer <= 0) { m.fdState = 'recover'; m.fdTimer = 0.8; }
+      break;
+
+    case 'flame_breath':
+      // Stream of fire in player direction
+      m.vx = 0;
+      m.vy = 0;
+      if (m.fdTimer > 0.5) {
+        if (Math.random() < 0.25) addParticle('吼', m.x+m.w/2, m.y+m.h/2, m.facing*20, -10, '#FF3D00', 16, 0.35);
+      } else if (m.fdTimer > 0) {
+        // Rapid fire stream
+        if (Math.random() < 0.35) {
+          const spread = (Math.random()-0.5) * 30;
+          spawnProjectile(m.x+m.w/2+m.facing*20, m.y+m.h/2, m.facing*(180+Math.random()*60), spread+30, '焰', '#FF3D00', 1);
+        }
+      }
+      if (m.fdTimer <= -0.3) { m.fdState = 'recover'; m.fdTimer = 0.6; }
+      break;
+
+    case 'flame_wave':
+      // Phase2+: fire wave along ground
+      m.vx = 0;
+      m.vy = 0;
+      if (m.fdTimer > 0.4) {
+        if (Math.random() < 0.15) addParticle('焰', m.x+m.w/2, m.y+m.h, 0, 10, '#FF6D00', 14, 0.3);
+      } else if (m.fdTimer > 0.3) {
+        // Fire wave along ground from dragon position
+        for (let i = 0; i < 4; i++) {
+          const waveVx = m.facing * (100 + i * 50);
+          const p = {x: m.x+m.w/2, y: m.y+m.h-8, vx: waveVx, vy: -60-i*20, c:'焰', col:'#FF6D00', dmg:2, w:14, h:14, life:2.0, fromPlayer:false, hasGravity:true};
+          projectiles.push(p);
+        }
+        cam.shake(5, 0.2);
+        m.fdTimer = 0.2;
+      }
+      if (m.fdTimer <= 0) { m.fdState = 'recover'; m.fdTimer = 0.7; }
+      break;
+
+    // MODULE 2: Dive attacks
+    case 'swoop':
+      // Quick swoop toward player
+      if (m.fdTimer > 0.4) {
+        // Rise up
+        m.vy = -200;
+        m.vx = 0;
+      } else if (m.fdTimer > 0) {
+        // Dive toward player
+        m.vx = m.facing * 350;
+        m.vy = 200;
+        if (!player.dead && aabbHit(m.x-8,m.y,m.w+16,m.h,player.x,player.y,player.w,player.h)) {
+          hurtPlayer(2);
+          cam.shake(6, 0.2);
+        }
+      }
+      if (m.fdTimer <= 0) {
+        m.vx = 0;
+        m.vy = 0;
+        m.y = homeY;
+        m.fdState = 'recover';
+        m.fdTimer = 1.0;
+      }
+      break;
+
+    case 'dive_bomb':
+      // Phase2+: rise high then slam down with explosion
+      if (m.fdTimer > 0.5) {
+        m.vy = -300;
+        m.vx = m.facing * 30;
+        if (Math.random() < 0.15) addParticle('翼', m.x+m.w/2, m.y+m.h, (Math.random()-0.5)*30, 10, '#FF5722', 16, 0.3);
+      } else if (m.fdTimer > 0.15) {
+        // Dive straight down at player x
+        m.vy = 500;
+        m.vx = m.facing * 100;
+      } else if (m.fdTimer > 0) {
+        // Impact
+        cam.shake(10, 0.3);
+        for (let i = 0; i < 5; i++) {
+          addParticle('爆', m.x+m.w/2+(Math.random()-0.5)*40, m.y+m.h, (Math.random()-0.5)*80, -60-Math.random()*40, '#FF3D00', 18, 0.5);
+        }
+        // Explosion projectiles in all directions
+        for (let i = 0; i < 6; i++) {
+          const angle = (i / 6) * Math.PI * 2;
+          spawnProjectile(m.x+m.w/2, m.y+m.h, Math.cos(angle)*120, Math.sin(angle)*120-40, '焰', '#FF5722', 2);
+        }
+        if (dist < 80 && Math.abs(player.y - m.y) < 50) hurtPlayer(3);
+        m.fdTimer = -0.1;
+      }
+      if (m.fdTimer <= -0.1) {
+        m.vy = 0; m.vx = 0;
+        m.y = homeY;
+        m.fdState = 'recover';
+        m.fdTimer = 1.2;
+      }
+      break;
+
+    // MODULE 3: Rain of fire
+    case 'fire_rain':
+      // Phase3: fly across screen raining fire
+      m.vy = -100;
+      m.vx = m.facing * 200;
+      if (m.y < homeY - 80) m.vy = 0;
+      if (Math.random() < 0.2) {
+        const rx = m.x + m.w/2 + (Math.random()-0.5)*40;
+        spawnProjectile(rx, m.y+m.h, (Math.random()-0.5)*20, 120+Math.random()*60, '雨', '#FF3D00', 1);
+        addParticle('焰', rx, m.y+m.h, 0, 20, '#FF6D00', 10, 0.25);
+      }
+      if (m.fdTimer <= -1.5) {
+        m.vx = 0; m.vy = 0;
+        m.y = homeY;
+        m.fdState = 'recover';
+        m.fdTimer = 1.0;
+      }
+      break;
+
+    case 'fury_barrage':
+      // Phase3: rapid fire in random directions while moving
+      m.vx = m.facing * 150;
+      m.vy = Math.sin(m.aiTimer * 3) * 60;
+      if (Math.random() < 0.2) {
+        spawnProjectile(m.x+m.w/2, m.y+m.h/2, (Math.random()-0.5)*200, 40+Math.random()*120, '焰', '#FF1744', 2);
+      }
+      if (m.fdTimer <= -1.2) {
+        m.vx = 0; m.vy = 0;
+        m.y = homeY;
+        m.fdState = 'recover';
+        m.fdTimer = 1.5;
+      }
+      break;
+
+    case 'recover':
+      m.vx *= 0.9;
+      if (m.fdTimer <= 0) {
+        const idleTime = m.phase >= 3 ? 0.6 : (m.phase >= 2 ? 1.0 : 1.5);
+        m.fdState = 'hover';
+        m.fdTimer = idleTime;
+      }
+      break;
+  }
+}
+
+function aiBoss(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  m.facing = dx>0?1:-1;
+  const hpPct = m.hp / m.maxHp;
+  if (!m.phase) m.phase = 1;
+  if (hpPct < 0.6 && m.phase===1) m.phase=2;
+  if (hpPct < 0.3 && m.phase===2) m.phase=3;
+
+  if (!m.bossState) m.bossState = 'idle';
+  if (m.bossTimer === undefined) m.bossTimer = 1.0;
+  if (m.bossCombo === undefined) m.bossCombo = 0;
+  m.bossTimer -= dt;
+
+  const pickAttack = () => {
+    const attacks = ['dash','slam','projectile'];
+    if (m.phase >= 2) attacks.push('summon');
+    if (m.phase >= 3) attacks.push('barrage');
+    return attacks[Math.floor(Math.random()*attacks.length)];
+  };
+
+  switch(m.bossState) {
+    case 'idle':
+      m.vx = m.facing * (m.speed||80);
+      if (m.bossTimer <= 0) {
+        m.bossState = pickAttack();
+        m.bossTimer = 0.6;
+        m.vx = 0;
+      }
+      break;
+
+    case 'dash':
+      // Windup then dash
+      if (m.bossTimer > 0.3) {
+        m.vx = 0;
+        if (Math.random()<0.15) addParticle('冲', m.x+m.w/2, m.y+m.h/2, m.facing*20, 0, '#D50000', 14, 0.3);
+      } else if (m.bossTimer > 0) {
+        m.vx = m.facing * 400;
+        if (!player.dead && aabbHit(m.x-5,m.y,m.w+10,m.h,player.x,player.y,player.w,player.h)) {
+          hurtPlayer(2);
+          cam.shake(5,0.2);
+        }
+      }
+      if (m.bossTimer <= 0) {
+        m.bossState = 'recover';
+        m.bossTimer = 0.8;
+        m.vx = 0;
+      }
+      break;
+
+    case 'slam':
+      // Jump up then slam down
+      if (m.bossTimer > 0.35) {
+        if (m.vy >= 0) m.vy = -500;
+        m.vx = m.facing * 60;
+      } else if (m.bossTimer > 0) {
+        if (m.vy < 400) m.vy = 600;
+        m.vx = 0;
+      }
+      if (m.bossTimer <= 0 || (m.grounded && m.bossTimer < 0.3)) {
+        cam.shake(8, 0.3);
+        addParticle('震', m.x+m.w/2, m.y+m.h, -40, -20, '#D50000', 20, 0.5);
+        addParticle('震', m.x+m.w/2, m.y+m.h, 40, -20, '#D50000', 20, 0.5);
+        addParticle('震', m.x+m.w/2, m.y+m.h, 0, -40, '#D50000', 24, 0.5);
+        if (dist < 80 && Math.abs(player.y - m.y) < 60) hurtPlayer(3);
+        m.bossState = 'recover';
+        m.bossTimer = 1.0;
+        m.vy = 0;
+      }
+      break;
+
+    case 'projectile':
+      m.vx = 0;
+      if (m.bossTimer > 0.3) {
+        // Charge up
+        if (Math.random()<0.2) addParticle('暗', m.x+m.w/2, m.y+m.h/2, (Math.random()-0.5)*30, (Math.random()-0.5)*30, '#D50000', 12, 0.3);
+      } else if (m.bossTimer > 0.2) {
+        // Fire
+        const spread = m.phase >= 3 ? 3 : (m.phase >= 2 ? 2 : 1);
+        for (let i=0; i<spread; i++) {
+          const angle = (i - (spread-1)/2) * 0.3;
+          const spd = 200;
+          spawnProjectile(m.x+m.w/2, m.y+m.h/2, m.facing*spd*Math.cos(angle), spd*Math.sin(angle), '暗', '#D50000', 2);
+        }
+        m.bossTimer = 0.1;
+      }
+      if (m.bossTimer <= 0) {
+        m.bossState = 'recover';
+        m.bossTimer = 0.6;
+      }
+      break;
+
+    case 'summon':
+      m.vx = 0;
+      if (m.bossTimer > 0.3) {
+        if (Math.random()<0.2) addParticle('影', m.x+m.w/2, m.y, (Math.random()-0.5)*40, -30, '#D50000', 14, 0.4);
+      }
+      if (m.bossTimer <= 0.3 && m.bossTimer > 0.2) {
+        const count = m.phase >= 3 ? 3 : 2;
+        for (let i=0; i<count; i++) {
+          if (monsters.length < 12) {
+            const sx = m.x + (Math.random()-0.5)*120;
+            monsters.push(createMonster('影', sx, m.y - 20));
+            addParticle('影', sx+12, m.y-6, 0, -40, '#444', 18, 0.5);
+          }
+        }
+        cam.shake(4, 0.15);
+        m.bossTimer = 0.1;
+      }
+      if (m.bossTimer <= 0) {
+        m.bossState = 'recover';
+        m.bossTimer = 0.8;
+      }
+      break;
+
+    case 'barrage':
+      m.vx = m.facing * 120;
+      if (Math.random() < 0.15) {
+        spawnProjectile(m.x+m.w/2, m.y+m.h/2, (Math.random()-0.5)*200, -100+Math.random()*200, '暗', '#FF1744', 2);
+      }
+      if (m.bossTimer <= -1.0) {
+        m.bossState = 'recover';
+        m.bossTimer = 1.2;
+        m.vx = 0;
+      }
+      break;
+
+    case 'recover':
+      m.vx *= 0.9;
+      if (m.bossTimer <= 0) {
+        m.bossCombo++;
+        // Faster cycle at lower HP
+        const idleTime = m.phase >= 3 ? 0.5 : (m.phase >= 2 ? 0.8 : 1.2);
+        m.bossState = 'idle';
+        m.bossTimer = idleTime;
+      }
+      break;
+  }
+}
+
+// ==================== DRAGON BOSS AI ====================
+function aiDragonBoss(m, dt) {
+  const dx = player.x - m.x;
+  const dist = Math.abs(dx);
+  m.facing = dx > 0 ? 1 : -1;
+  const hpPct = m.hp / m.maxHp;
+  if (!m.phase) m.phase = 1;
+  if (hpPct < 0.6 && m.phase === 1) m.phase = 2;
+  if (hpPct < 0.3 && m.phase === 2) m.phase = 3;
+
+  if (!m.dragonState) m.dragonState = 'idle';
+  if (m.dragonTimer === undefined) m.dragonTimer = 1.5;
+  m.dragonTimer -= dt;
+
+  const pickAttack = () => {
+    const atks = ['flame_breath','bite','dive','fly_flame'];
+    if (m.phase >= 2) atks.push('tail_sweep','triple_flame');
+    if (m.phase >= 3) atks.push('rage_dive','summon_flame');
+    return atks[Math.floor(Math.random() * atks.length)];
+  };
+
+  switch (m.dragonState) {
+    case 'idle':
+      m.vx = m.facing * (m.speed || 60);
+      m.dragonFlying = false;
+      if (m.dragonTimer <= 0) {
+        m.dragonState = pickAttack();
+        m.dragonTimer = 0.8;
+        m.vx = 0;
+      }
+      break;
+
+    // Ground flame breath: 3 parabolic fireballs
+    case 'flame_breath':
+      m.vx = 0;
+      if (m.dragonTimer > 0.4) {
+        // Charge up - roar particles
+        if (Math.random() < 0.25) addParticle('吼', m.x + m.w/2, m.y, (Math.random()-0.5)*40, -30, '#FF3D00', 16, 0.4);
+      } else if (m.dragonTimer > 0.25) {
+        // Fire 3 parabolic flames
+        const baseSpd = 180 + m.phase * 30;
+        for (let i = 0; i < 3; i++) {
+          const angle = -0.5 + i * 0.25; // upward arcs
+          const vx = m.facing * baseSpd * (0.7 + i * 0.25);
+          const vy = -160 - i * 40;
+          const p = {x: m.x + m.w/2 + m.facing*30, y: m.y + 20,
+            vx, vy, c:'焰', col:'#FF3D00', dmg:2, w:14, h:14, life:2.5, fromPlayer:false, hasGravity:true};
+          projectiles.push(p);
+        }
+        m.dragonTimer = 0.15;
+      }
+      if (m.dragonTimer <= 0) {
+        m.dragonState = 'recover';
+        m.dragonTimer = 0.8;
+      }
+      break;
+
+    // Bite attack - lunge forward
+    case 'bite':
+      if (m.dragonTimer > 0.4) {
+        m.vx = 0;
+        if (Math.random() < 0.15) addParticle('噬', m.x + m.facing*m.w, m.y + m.h/2, m.facing*15, 0, '#D50000', 14, 0.3);
+      } else if (m.dragonTimer > 0) {
+        m.vx = m.facing * 350;
+        if (!player.dead && aabbHit(m.x - 10, m.y, m.w + 20, m.h, player.x, player.y, player.w, player.h)) {
+          hurtPlayer(3);
+          cam.shake(6, 0.25);
+        }
+      }
+      if (m.dragonTimer <= 0) {
+        m.dragonState = 'recover';
+        m.dragonTimer = 1.0;
+        m.vx = 0;
+      }
+      break;
+
+    // Dive from sky
+    case 'dive':
+      if (m.dragonTimer > 0.5) {
+        // Fly up
+        m.dragonFlying = true;
+        m.vy = -350;
+        m.vx = m.facing * 30;
+        m.dragonDiveStartY = m.y;
+      } else if (m.dragonTimer > 0.15) {
+        // Hover, track player X
+        m.vy = 0;
+        m.vx = (player.x - m.x) > 0 ? 120 : -120;
+        m.dragonFlying = true;
+      } else if (m.dragonTimer > -0.5) {
+        // Dive down
+        m.dragonFlying = false;
+        m.vy = 650;
+        m.vx = m.facing * 60;
+        if (!player.dead && aabbHit(m.x - 5, m.y, m.w + 10, m.h + 10, player.x, player.y, player.w, player.h)) {
+          hurtPlayer(3);
+          cam.shake(8, 0.3);
+        }
+      }
+      if (m.grounded && m.dragonTimer < 0.1) {
+        cam.shake(10, 0.4);
+        addParticle('震', m.x + m.w/2, m.y + m.h, -50, -30, '#D50000', 22, 0.5);
+        addParticle('震', m.x + m.w/2, m.y + m.h, 50, -30, '#D50000', 22, 0.5);
+        addParticle('震', m.x + m.w/2, m.y + m.h, 0, -50, '#FF3D00', 26, 0.5);
+        if (dist < 100 && Math.abs(player.y - m.y) < 70) hurtPlayer(2);
+        m.dragonState = 'recover';
+        m.dragonTimer = 1.2;
+        m.dragonFlying = false;
+        m.vy = 0;
+        m.vx = 0;
+      }
+      if (m.dragonTimer <= -1.5) {
+        m.dragonState = 'recover';
+        m.dragonTimer = 1.0;
+        m.dragonFlying = false;
+        m.vx = 0;
+      }
+      break;
+
+    // Fly and shoot flames downward
+    case 'fly_flame':
+      if (m.dragonTimer > 0.3) {
+        m.dragonFlying = true;
+        m.vy = -250;
+        m.vx = m.facing * 80;
+      } else if (m.dragonTimer > -1.5) {
+        m.dragonFlying = true;
+        m.vy = -10;
+        m.vx = m.facing * 100;
+        // Shoot flames periodically
+        if (Math.random() < 0.08) {
+          const p = {x: m.x + m.w/2, y: m.y + m.h,
+            vx: (Math.random()-0.5)*60, vy: 120 + Math.random()*80,
+            c:'焰', col:'#FF5722', dmg:2, w:12, h:12, life:2, fromPlayer:false, hasGravity:true};
+          projectiles.push(p);
+          addParticle('火', m.x + m.w/2, m.y + m.h, (Math.random()-0.5)*20, 10, '#FF5722', 10, 0.3);
+        }
+      }
+      if (m.dragonTimer <= -2.0) {
+        m.dragonState = 'recover';
+        m.dragonTimer = 1.0;
+        m.dragonFlying = false;
+        m.vx = 0;
+      }
+      break;
+
+    // Tail sweep (phase 2+)
+    case 'tail_sweep':
+      m.vx = 0;
+      if (m.dragonTimer > 0.3) {
+        if (Math.random() < 0.15) addParticle('尾', m.x - m.facing*20, m.y + m.h/2, -m.facing*30, 0, '#C62828', 16, 0.3);
+      } else if (m.dragonTimer > 0.1) {
+        // Sweep: damage in wide area behind
+        const sweepX = m.x - m.facing * 60;
+        if (!player.dead && aabbHit(sweepX, m.y, 120, m.h, player.x, player.y, player.w, player.h)) {
+          hurtPlayer(2);
+          cam.shake(5, 0.2);
+        }
+        addParticle('尾', m.x - m.facing*40, m.y + m.h*0.7, -m.facing*80, -20, '#C62828', 20, 0.4);
+        m.dragonTimer = 0.05;
+      }
+      if (m.dragonTimer <= 0) {
+        m.dragonState = 'recover';
+        m.dragonTimer = 0.8;
+      }
+      break;
+
+    // Triple parabolic flame (phase 2+)
+    case 'triple_flame':
+      m.vx = 0;
+      if (m.dragonTimer > 0.4) {
+        if (Math.random() < 0.3) addParticle('吼', m.x + m.facing*m.w, m.y + 10, m.facing*25, -15, '#FF3D00', 18, 0.3);
+      } else if (m.dragonTimer > 0.25) {
+        // Fire 5 parabolic flames with wider spread
+        for (let i = 0; i < 5; i++) {
+          const baseSpd = 150 + m.phase * 20;
+          const vx = m.facing * baseSpd * (0.5 + i * 0.2);
+          const vy = -200 - i * 30 + (Math.random()-0.5)*40;
+          const p = {x: m.x + m.w/2 + m.facing*30, y: m.y + 15,
+            vx, vy, c:'焰', col:'#FF6D00', dmg:2, w:14, h:14, life:3, fromPlayer:false, hasGravity:true};
+          projectiles.push(p);
+        }
+        m.dragonTimer = 0.1;
+      }
+      if (m.dragonTimer <= 0) {
+        m.dragonState = 'recover';
+        m.dragonTimer = 1.0;
+      }
+      break;
+
+    // Rage dive (phase 3) - multiple rapid dives
+    case 'rage_dive':
+      if (!m._rageDiveCount) m._rageDiveCount = 0;
+      if (m.dragonTimer > 0.3) {
+        m.dragonFlying = true;
+        m.vy = -400;
+        m.vx = (player.x - m.x) > 0 ? 150 : -150;
+      } else if (m.dragonTimer > -0.3) {
+        m.dragonFlying = false;
+        m.vy = 700;
+        m.vx = m.facing * 80;
+        if (!player.dead && aabbHit(m.x - 8, m.y, m.w + 16, m.h + 8, player.x, player.y, player.w, player.h)) {
+          hurtPlayer(3);
+          cam.shake(6, 0.2);
+        }
+      }
+      if (m.grounded && m.dragonTimer < 0) {
+        m._rageDiveCount++;
+        cam.shake(6, 0.2);
+        addParticle('震', m.x+m.w/2, m.y+m.h, -40, -25, '#FF1744', 18, 0.4);
+        addParticle('震', m.x+m.w/2, m.y+m.h, 40, -25, '#FF1744', 18, 0.4);
+        if (m._rageDiveCount >= 3) {
+          m.dragonState = 'recover';
+          m.dragonTimer = 1.5;
+          m._rageDiveCount = 0;
+          m.dragonFlying = false;
+          m.vx = 0;
+        } else {
+          m.dragonTimer = 0.5;
+          m.vy = 0;
+        }
+      }
+      if (m.dragonTimer <= -2.0) {
+        m.dragonState = 'recover';
+        m.dragonTimer = 1.2;
+        m._rageDiveCount = 0;
+        m.dragonFlying = false;
+        m.vx = 0;
+      }
+      break;
+
+    // Summon flame rain (phase 3)
+    case 'summon_flame':
+      m.vx = 0;
+      if (m.dragonTimer > 0.3) {
+        if (Math.random() < 0.2) addParticle('啸', m.x + m.w/2, m.y - 10, (Math.random()-0.5)*40, -40, '#FF6D00', 16, 0.4);
+      } else if (m.dragonTimer > -2.0) {
+        // Rain fire from above
+        if (Math.random() < 0.12) {
+          const rx = m.x + (Math.random()-0.5) * 300;
+          const p = {x: rx, y: m.y - 200,
+            vx: (Math.random()-0.5)*30, vy: 200 + Math.random()*100,
+            c:'焰', col:'#FF3D00', dmg:2, w:12, h:12, life:2.5, fromPlayer:false, hasGravity:true};
+          projectiles.push(p);
+        }
+      }
+      if (m.dragonTimer <= -2.5) {
+        m.dragonState = 'recover';
+        m.dragonTimer = 1.5;
+      }
+      break;
+
+    case 'recover':
+      m.vx *= 0.9;
+      m.dragonFlying = false;
+      if (m.dragonTimer <= 0) {
+        m.dragonCombo++;
+        const idleTime = m.phase >= 3 ? 0.4 : (m.phase >= 2 ? 0.7 : 1.0);
+        m.dragonState = 'idle';
+        m.dragonTimer = idleTime;
+      }
+      break;
+  }
+}
+
+function hurtMonster(m, dmg) {
+  if (m.dead) return;
+  let actualDmg = dmg;
+  // Ancient Golem shield: halve damage and reduce knockback
+  if (m.shielded) {
+    actualDmg = Math.max(1, Math.floor(dmg / 2));
+    addParticle('盾', m.x+m.w/2, m.y+m.h/2, (Math.random()-0.5)*30, -30, '#8D6E63', 16, 0.3);
+  }
+  m.hp -= actualDmg;
+  m.hurtTimer = 0.3;
+  m.vx = (player.x < m.x ? 1 : -1) * (m.shielded ? 30 : 100);
+  addParticle(cnNum(actualDmg), m.x+m.w/2, m.y-10, 0, -60, '#FFD600', 16, 0.7, 0);
+  if (player.fireWeapon) m.burning = 3;
+  if (player.poisonWeapon) m.poisoned = 3;
+  if (player.frostWeapon) m.stunned = Math.max(m.stunned, 2);
+
+  if (m.hp <= 0) {
+    m.dead = true;
+    m.deathTimer = 0.5;
+    // Track kill
+    if (!killStats[m.type]) killStats[m.type] = 0;
+    killStats[m.type]++;
+    const chars = getMonsterChars(m.type);
+    for (const c of chars) {
+      addParticle(c, m.x+m.w/2, m.y+m.h/2, (Math.random()-0.5)*120, -80-Math.random()*60, '#888', 18, 0.6, 200);
+    }
+    if (m.drops && m.drops.length > 0 && Math.random() < (m.dropChance||0.5)) {
+      // Drop ALL items, spread horizontally to avoid overlap
+      const count = m.drops.length;
+      const spacing = 24;
+      const startX = m.x + m.w/2 - (count-1)*spacing/2;
+      for (let di=0; di<count; di++) {
+        spawnItem(m.drops[di], startX + di*spacing, m.y);
+      }
+    }
+    // Story character drops from bosses
+    if (m.type === '火龙' && !storyChars.includes('龙')) {
+      storyChars.push('龙');
+      storyCharAnim = {char:'龙', phase:'drop', timer:0, x:m.x+m.w/2, y:m.y, targetX:GAME_W-60, targetY:10, size:36};
+      messageText = '获得剧情字：龙';
+      messageTimer = 3;
+    }
+    if (m.type === '魔王' && !storyChars.includes('魔')) {
+      storyChars.push('魔');
+      storyCharAnim = {char:'魔', phase:'drop', timer:0, x:m.x+m.w/2, y:m.y, targetX:GAME_W-40, targetY:10, size:36};
+      messageText = '获得剧情字：魔';
+      messageTimer = 3;
+    }
+  }
+}
+
+function getMonsterChars(type) {
+  switch(type) {
+    case '魔': return ['魔'];
+    case '野猪': return ['野','猪'];
+    case '毒蛛': return ['毒','蛛'];
+    case '蝙蝠': return ['蝙','蝠'];
+    case '火法师': return ['火','法','师'];
+    case '骷髅': return ['骷','髅'];
+    case '巨石人': return ['巨','石','人'];
+    case '影': return ['影'];
+    case '鬼将': return ['鬼','将'];
+    case '火龙': return ['火','龙'];
+    case '魔王': return ['魔','王'];
+    case '魔龙': return ['魔','龙','翼','鳞','爪','尾','角'];
+    case '长蛇': return ['长','蛇'];
+    case '树妖': return ['树','妖'];
+    case '冰灵': return ['冰','灵'];
+    case '刺客': return ['刺','客'];
+    case '雷兽': return ['雷','兽'];
+    case '熔炎魔': return ['熔','炎','魔'];
+    case '冥蟒': return ['冥','蟒'];
+    case '古傀儡': return ['古','傀','儡'];
+    default: return [type];
+  }
+}
+
+function renderMonster(ctx, m) {
+  if (m.dead) return;
+  const ox = m.x - cam.x + cam.shakeX;
+  const oy = m.y - cam.y + cam.shakeY;
+  const flash = m.hurtTimer > 0 && Math.floor(m.hurtTimer*10)%2===0;
+  const alpha = m.type==='影' ? (m.shadowState==='dash' ? 0.7 : 0.35) : 1;
+
+  // Assassin: nearly invisible when hiding
+  if (m.type === '刺客' && !m.assVisible) {
+    // Only render faint shimmer
+    if (Math.random()<0.1) {
+      atlas.draw(ctx,'忍',20,'#444',ox+2,oy+6,0.08);
+    }
+    return;
+  }
+
+  switch(m.type) {
+    case '魔':
+      atlas.draw(ctx,'魔',28,flash?'#fff':'#9C27B0',ox,oy,alpha);
+      break;
+    case '野猪':
+      atlas.draw(ctx,'野',22,flash?'#fff':'#795548',ox,oy,alpha);
+      atlas.draw(ctx,'猪',22,flash?'#fff':'#795548',ox+22,oy,alpha);
+      break;
+    case '毒蛛':
+      atlas.draw(ctx,'毒',18,flash?'#fff':'#4CAF50',ox+3,oy-2,alpha);
+      atlas.draw(ctx,'蛛',20,flash?'#fff':'#4CAF50',ox,oy+16,alpha);
+      break;
+    case '蝙蝠':
+      atlas.draw(ctx,'蝙',16,flash?'#fff':'#616161',ox,oy,alpha);
+      atlas.draw(ctx,'蝠',16,flash?'#fff':'#616161',ox+16,oy,alpha);
+      break;
+    case '火法师':
+      atlas.draw(ctx,'火',20,flash?'#fff':'#FF5722',ox+6,oy-2,alpha);
+      atlas.draw(ctx,'法',18,flash?'#fff':'#FF5722',ox,oy+18,alpha);
+      atlas.draw(ctx,'师',18,flash?'#fff':'#FF5722',ox+16,oy+18,alpha);
+      break;
+    case '骷髅':
+      atlas.draw(ctx,'骷',20,flash?'#fff':'#ECEFF1',ox,oy,alpha);
+      atlas.draw(ctx,'髅',20,flash?'#fff':'#ECEFF1',ox,oy+20,alpha);
+      break;
+    case '巨石人': {
+      // Shake during windup
+      const wShake = m.slamState==='windup' ? (Math.random()-0.5)*4 : 0;
+      atlas.draw(ctx,'巨',24,flash?'#fff':'#9E9E9E',ox+8+wShake,oy,alpha);
+      atlas.draw(ctx,'石',28,flash?'#fff':'#9E9E9E',ox+4+wShake,oy+22,alpha);
+      atlas.draw(ctx,'人',24,flash?'#fff':'#9E9E9E',ox+8,oy+48,alpha);
+      break;
+    }
+    case '影': {
+      // Stretch during dash
+      const dashStretch = m.shadowState==='dash' ? 1.3 : 1;
+      ctx.save();
+      if (dashStretch > 1) {
+        ctx.translate(ox+12, oy+14);
+        ctx.scale(dashStretch, 1/dashStretch);
+        atlas.draw(ctx,'影',24,flash?'#fff':'#444',-12,-14,alpha);
+      } else {
+        atlas.draw(ctx,'影',24,flash?'#fff':'#444',ox,oy,alpha);
+      }
+      ctx.restore();
+      break;
+    }
+    case '鬼将': {
+      // Glow during summon
+      const sumGlow = m.ghostState === 'summon' ? 0.3+Math.sin(Date.now()*0.01)*0.2 : 0;
+      if (sumGlow > 0) {
+        atlas.draw(ctx,'影',28,'#3F51B5',ox,oy-4,sumGlow);
+      }
+      atlas.draw(ctx,'鬼',22,flash?'#fff':'#3F51B5',ox+4,oy,alpha);
+      atlas.draw(ctx,'将',22,flash?'#fff':'#3F51B5',ox+4,oy+22,alpha);
+      break;
+    }
+    case '火龙':
+      atlas.draw(ctx,'火',24,flash?'#fff':'#FF5722',ox+12,oy-4,alpha);
+      atlas.draw(ctx,'龙',32,flash?'#fff':'#FF1744',ox+4,oy+18,alpha);
+      break;
+    case '魔王': {
+      const glow = m.phase===3 ? '#FF1744' : '#D50000';
+      // Boss state visual
+      if (m.bossState==='dash') {
+        addParticle('暗', m.x+m.w/2, m.y+m.h/2, -m.facing*20, 0, '#D50000', 14, 0.2);
+      }
+      if (m.bossState==='slam' && m.bossTimer < 0.35) {
+        atlas.draw(ctx,'震',20,'#D50000',ox+14,oy+56,0.6);
+      }
+      atlas.draw(ctx,'魔',36,flash?'#fff':glow,ox+4,oy,alpha);
+      atlas.draw(ctx,'王',36,flash?'#fff':'#D50000',ox+4,oy+34,alpha);
+      if (m.phase>=2 && Math.random()<0.08) {
+        addParticle('暗',m.x+(Math.random()-0.5)*m.w,m.y-10,(Math.random()-0.5)*30,-20,'#D50000',10,0.4);
+      }
+      break;
+    }
+    case '长蛇': {
+      // Wavy snake body
+      const wave = Math.sin(m.aiTimer*6)*3;
+      atlas.draw(ctx,'长',16,flash?'#fff':'#558B2F',ox,oy+wave,alpha);
+      atlas.draw(ctx,'蛇',18,flash?'#fff':'#33691E',ox+16,oy-wave,alpha);
+      break;
+    }
+    case '树妖': {
+      atlas.draw(ctx,'树',24,flash?'#fff':'#5D4037',ox+4,oy,alpha);
+      atlas.draw(ctx,'妖',20,flash?'#fff':'#2E7D32',ox+6,oy+24,alpha);
+      // Leaf particles idle
+      if (Math.random()<0.03) addParticle('叶',m.x+m.w/2,m.y,(Math.random()-0.5)*15,-10,'#4CAF50',8,0.8,20);
+      break;
+    }
+    case '冰灵': {
+      const iceGlow = 0.7+Math.sin(m.aiTimer*3)*0.3;
+      atlas.draw(ctx,'冰',22,flash?'#fff':'#4FC3F7',ox,oy,iceGlow);
+      atlas.draw(ctx,'灵',16,flash?'#fff':'#B3E5FC',ox+4,oy+18,iceGlow);
+      break;
+    }
+    case '刺客': {
+      const strikeFlash = m.assState==='strike' ? '#FF1744' : '#37474F';
+      atlas.draw(ctx,'刺',18,flash?'#fff':strikeFlash,ox+3,oy,alpha);
+      atlas.draw(ctx,'客',18,flash?'#fff':'#37474F',ox+3,oy+18,alpha);
+      break;
+    }
+    case '雷兽': {
+      // Body shakes during charge_windup and stomp_windup
+      const tbShake = (m.tbState==='charge_windup'||m.tbState==='stomp_windup') ? (Math.random()-0.5)*5 : 0;
+      // Lightning crackle during charge
+      if (m.tbState==='charge' && Math.random()<0.3) {
+        addParticle('电',m.x+m.w/2,m.y+(Math.random()-0.5)*m.h,m.facing*-20,(Math.random()-0.5)*20,'#FFD600',10,0.15);
+      }
+      atlas.draw(ctx,'雷',26,flash?'#fff':'#FDD835',ox+12+tbShake,oy-2,alpha);
+      atlas.draw(ctx,'兽',30,flash?'#fff':'#FF8F00',ox+8+tbShake,oy+24,alpha);
+      // Stomp shockwave ring
+      if (m.tbState==='stomp') {
+        const ring = 1 - m.tbTimer/0.2;
+        atlas.draw(ctx,'震',20+ring*16,'#FFD600',ox+m.w/2-18,oy+m.h-10,0.6-ring*0.5);
+      }
+      break;
+    }
+    case '熔炎魔': {
+      // Glow pulsates
+      const lavaGlow = 0.85+Math.sin(m.aiTimer*4)*0.15;
+      // Punch windup arm glow
+      if (m.ldState==='punch_windup') {
+        atlas.draw(ctx,'焰',16,'#FF3D00',ox+m.facing*m.w-8,oy+m.h/2-8,0.6+Math.sin(m.ldTimer*12)*0.3);
+      }
+      atlas.draw(ctx,'熔',26,flash?'#fff':'#FF6D00',ox+8,oy,lavaGlow);
+      atlas.draw(ctx,'炎',28,flash?'#fff':'#BF360C',ox+6,oy+24,alpha);
+      atlas.draw(ctx,'魔',22,flash?'#fff':'#D84315',ox+10,oy+50,alpha);
+      // Eruption charge glow
+      if (m.ldState==='eruption_charge') {
+        atlas.draw(ctx,'焰',14+Math.sin(m.ldTimer*8)*4,'#FF3D00',ox+m.w/2-8,oy-10,0.5);
+      }
+      break;
+    }
+    case '冥蟒': {
+      // Body undulates in flight
+      const sway = Math.sin(m.aiTimer*3)*4;
+      const diveAlpha = m.asState==='dive' ? 0.7 : alpha;
+      // Dive trail
+      if (m.asState==='dive' && Math.random()<0.2) {
+        addParticle('冥',m.x+m.w/2,m.y+m.h/2,(Math.random()-0.5)*15,(Math.random()-0.5)*15,'#4A148C',12,0.3);
+      }
+      atlas.draw(ctx,'冥',26,flash?'#fff':'#7B1FA2',ox+14+sway,oy-4,diveAlpha);
+      atlas.draw(ctx,'蟒',30,flash?'#fff':'#4A148C',ox+10-sway,oy+20,diveAlpha);
+      // Breath charge mouth glow
+      if (m.asState==='breath_charge'||m.asState==='breath') {
+        atlas.draw(ctx,'息',12+Math.sin(m.aiTimer*10)*3,'#CE93D8',ox+m.facing*26+22,oy+10,0.5+Math.sin(m.aiTimer*8)*0.3);
+      }
+      break;
+    }
+    case '古傀儡': {
+      // Shield glow when guarding
+      if (m.shielded) {
+        const shieldAlpha = 0.3+Math.sin(m.aiTimer*2)*0.1;
+        ctx.save();
+        ctx.globalAlpha = shieldAlpha;
+        ctx.fillStyle = '#8D6E63';
+        ctx.beginPath();
+        ctx.arc(ox+m.w/2, oy+m.h/2, m.w*0.7, 0, Math.PI*2);
+        ctx.fill();
+        ctx.restore();
+      }
+      // Punch combo animation
+      const punchOff = m.agState==='punch' ? m.facing*8*Math.sin(m.agTimer*25) : 0;
+      atlas.draw(ctx,'古',26,flash?'#fff':'#5D4037',ox+10+punchOff,oy,alpha);
+      atlas.draw(ctx,'傀',26,flash?'#fff':'#4E342E',ox+10,oy+26,alpha);
+      atlas.draw(ctx,'儡',26,flash?'#fff':'#3E2723',ox+10,oy+52,alpha);
+      // Laser charge eyes
+      if (m.agState==='laser_charge') {
+        atlas.draw(ctx,'光',10+Math.sin(m.agTimer*12)*3,'#FF6D00',ox+14,oy+8,0.7);
+        atlas.draw(ctx,'光',10+Math.sin(m.agTimer*12)*3,'#FF6D00',ox+30,oy+8,0.7);
+      }
+      break;
+    }
+    case '魔龙': {
+      const f = m.facing;
+      const t = m.aiTimer || 0;
+      const st = m.dragonState || 'idle';
+      const glow = m.phase===3 ? '#FF1744' : (m.phase===2 ? '#D50000' : '#B71C1C');
+      const bodyShake = (st==='bite'||st==='rage_dive') ? (Math.random()-0.5)*4 : 0;
+      const sk = bodyShake;
+      const cx = m.w / 2;
+
+      // ---- Wing animation state ----
+      // wp: 0=folded, 1=spread
+      let wTgt = 0.5, wSpd = 3;
+      if (st==='idle') { wTgt = 0.35 + Math.sin(t*1.2)*0.1; wSpd = 2; }
+      else if (st==='fly_flame'||st==='summon_flame') { wTgt = 1.0; wSpd = 6; }
+      else if (m.dragonFlying) { wTgt = 0.95; wSpd = 8; }
+      else if (st==='dive'||st==='rage_dive') { wTgt = m.dragonTimer>0.15?1.0:0.08; wSpd = 12; }
+      else if (st==='flame_breath'||st==='triple_flame') { wTgt = 0.9; wSpd = 5; }
+      else if (st==='bite') { wTgt = m.dragonTimer/0.8>0.5?0.2:0.95; wSpd = 14; }
+      else if (st==='tail_sweep') { wTgt = 0.7; }
+      else if (st==='recover') { wTgt = 0.15; wSpd = 4; }
+      if (m._wp === undefined) m._wp = 0.5;
+      m._wp += (wTgt - m._wp) * Math.min(1, wSpd * 0.016);
+      const wp = m._wp;
+
+      // Wing beat (vertical flap offset)
+      let wBeat = Math.sin(t * 3) * 3;
+      if (st==='fly_flame'||st==='summon_flame'||st==='dive'||st==='rage_dive') wBeat = Math.sin(t*10)*7;
+      else if (m.dragonFlying) wBeat = Math.sin(t*8)*6;
+      else if (st==='bite') wBeat = Math.sin(t*14)*5;
+
+
+      const drawWing = (dir, sx, sy) => {
+        const sz = 14;
+        const g = sz * 1.3;
+
+        // Triangle vertices at full spread, relative to shoulder S=(0,0)
+        // Hypotenuse length
+        const hypLen = g * 6;
+
+        const SF = hypLen * 3 / 4;
+        const FT = hypLen / 4;
+        const Rh = hypLen * Math.sqrt(3) / 4; // height of R above hypotenuse
+
+        // Vertices (spread)
+        // S = (0, 0), T = (hypLen, 0), R = (SF, -Rh), F = (SF, 0)
+
+        // Fold angles: when wp=0, sub-triangles fold down ~90°
+        const foldInner = (1 - wp) * Math.PI * 0.5;  // inner sub-tri (S-R-F)
+        const foldOuter = (1 - wp) * Math.PI * 0.45;  // outer sub-tri (F-R-T), slightly less
+
+        // Rotate point (px,py) around pivot (pivX, pivY) by angle (clockwise)
+        const rotP = (px, py, pivX, pivY, angle) => {
+          const dx = px - pivX, dy = py - pivY;
+          const c = Math.cos(angle), s = Math.sin(angle);
+          return [pivX + dx*c - dy*s, pivY + dx*s + dy*c];
+        };
+
+        // Fill each sub-triangle with 翼 chars
+        const cols = ['#1A0000','#2D0000','#440000','#5C0000','#700000','#8B0000','#A01010'];
+
+        // Sub-triangle 1: S(0,0) → R(SF,-Rh) → F(SF,0)
+        // Scan rows from S edge to F edge
+        const n1 = 4; // rows in inner sub-tri
+        for (let r = 0; r < n1; r++) {
+          const rf = r / (n1 - 1); // 0=S side, 1=F side
+          // Left edge: lerp S→S (always at x=0 bottom) → actually along S→F bottom
+          // Right edge: lerp S→R (going up to peak)
+          // Better: scan horizontally. At fraction rf along SF:
+          const baseX = SF * rf;  // x along bottom S→F
+          const topX = SF;        // R.x is always SF
+          const topY = -Rh * (1 - rf); // height decreases toward F
+          // Row spans from (baseX, 0) to (baseX, topY * (1-rf)... )
+          // Actually let's place chars in a grid within the triangle
+          const rowBottom = baseX;
+          const rowTop = baseX; // vertical column at this x
+          const colHeight = Rh * (baseX / SF); // height at this x = Rh * (x/SF)
+          const nV = Math.max(1, Math.round(colHeight / g));
+          for (let v = 0; v < nV; v++) {
+            const vf = nV > 1 ? v / (nV - 1) : 0;
+            let px = baseX;
+            let py = -colHeight * vf; // 0=bottom, -colHeight=top
+            // Apply fold: rotate around S-F axis (y=0 line), pivot at (baseX, 0)
+            [px, py] = rotP(px, py, px, 0, foldInner);
+            const ci = Math.min(cols.length-1, Math.floor(rf * 3 + vf * 3));
+            const a = 0.6 + rf*0.15 + vf*0.15;
+            atlas.draw(ctx,'翼',sz,flash?'#fff':cols[ci],
+              sx + px*dir, sy + py + wBeat*(1-rf)*0.5, Math.min(1,a)*alpha);
+          }
+        }
+
+        // Sub-triangle 2: F(SF,0) → R(SF,-Rh) → T(hypLen,0)
+        const n2 = 3; // rows in outer sub-tri
+        for (let r = 0; r < n2; r++) {
+          const rf = r / (n2 - 1); // 0=F side, 1=T side
+          const baseX = SF + FT * rf; // x along F→T
+          const colHeight = Rh * (1 - rf); // height at this x decreases toward T
+          const nV = Math.max(1, Math.round(colHeight / g));
+          for (let v = 0; v < nV; v++) {
+            const vf = nV > 1 ? v / (nV - 1) : 0;
+            let px = baseX;
+            let py = -colHeight * vf;
+            // Apply fold: rotate around F-T axis, pivot at (baseX, 0)
+            [px, py] = rotP(px, py, px, 0, foldOuter);
+            const ci = Math.min(cols.length-1, Math.floor((rf+1)*2 + vf*2));
+            const a = 0.55 + rf*0.2 + vf*0.1;
+            atlas.draw(ctx,'翼',sz,flash?'#fff':cols[ci],
+              sx + px*dir, sy + py + wBeat*(1-rf)*0.4, Math.min(1,a)*alpha);
+          }
+        }
+      };
+
+      // Wing shoulder positions (at body sides)
+      const wsy = oy + 24;
+      drawWing(-1, ox+cx-14, wsy + wBeat*0.05);
+      drawWing( 1, ox+cx+14, wsy - wBeat*0.05);
+
+      // ---- Body layout ----
+      const tailWave = Math.sin(t * 4) * 5;
+
+      // Row 0: 角角 (horns) at top
+      atlas.draw(ctx,'角',14,flash?'#fff':'#FF6F00', ox+cx-16+sk, oy+0, alpha);
+      atlas.draw(ctx,'角',14,flash?'#fff':'#FF6F00', ox+cx+4+sk, oy+0, alpha);
+
+      // Row 1: 魔龙 (head, big)
+      atlas.draw(ctx,'魔',26,flash?'#fff':'#111', ox+cx-26+sk, oy+12, alpha);
+      atlas.draw(ctx,'龙',26,flash?'#fff':glow, ox+cx+0+sk, oy+12, alpha);
+
+      // Fire FX when breathing
+      if (st==='flame_breath'||st==='triple_flame'||st==='summon_flame') {
+        const fireX = ox + cx + f * 30;
+        atlas.draw(ctx,'火',16,'#FF3D00', fireX+sk, oy+14, 0.7+Math.sin(t*14)*0.3);
+        atlas.draw(ctx,'焰',12,'#FF6D00', fireX+f*14+sk, oy+18, 0.5+Math.sin(t*10)*0.3);
+      }
+
+      // Row 3: 鳞鳞鳞 (scales body)
+      atlas.draw(ctx,'鳞',14,flash?'#fff':'#8B0000', ox+cx-22+sk, oy+38, alpha);
+      atlas.draw(ctx,'鳞',14,flash?'#fff':'#6D0000', ox+cx-6+sk, oy+38, alpha);
+      atlas.draw(ctx,'鳞',14,flash?'#fff':'#8B0000', ox+cx+10+sk, oy+38, alpha);
+
+      // Row 4: 爪  爪 (claws at bottom)
+      atlas.draw(ctx,'爪',16,flash?'#fff':'#D32F2F', ox+cx-20+sk, oy+52, alpha);
+      atlas.draw(ctx,'爪',16,flash?'#fff':'#D32F2F', ox+cx+8+sk, oy+52, alpha);
+
+      // Tail: 尾尾 (behind, wavy)
+      const tailDir = -f; // tail opposite to facing
+      const tailBaseX = ox + cx + tailDir * 28;
+      atlas.draw(ctx,'尾',16,flash?'#fff':'#C62828', tailBaseX+sk, oy+40+tailWave, alpha);
+      atlas.draw(ctx,'尾',16,flash?'#fff':'#A01010', tailBaseX+tailDir*14+sk, oy+42+tailWave*1.3, alpha*0.9);
+
+      // State FX particles
+      if (st==='dash'||st==='dive'||st==='rage_dive') {
+        addParticle('暗', m.x+m.w/2, m.y+m.h/2, -f*20, 0, '#D50000', 14, 0.2);
+      }
+      if (st==='bite' && m.dragonTimer < 0.35) {
+        atlas.draw(ctx,'噬',18,'#D50000', ox+cx+f*28+sk, oy+18, 0.6);
+      }
+      // Phase particles
+      if (m.phase>=2 && Math.random()<0.08) {
+        addParticle('暗',m.x+(Math.random()-0.5)*m.w,m.y-10,(Math.random()-0.5)*30,-20,'#D50000',10,0.4);
+      }
+      if (m.phase>=3 && Math.random()<0.06) {
+        addParticle('焰',m.x+Math.random()*m.w,m.y+m.h,(Math.random()-0.5)*40,15,'#8B0000',12,0.3);
+      }
+      break;
+    }
+  }
+
+  // HP bar
+  if (m.hp < m.maxHp) {
+    const barW = m.w;
+    const barY = oy - 8;
+    ctx.fillStyle = '#eee';
+    ctx.fillRect(ox, barY, barW, 4);
+    ctx.fillStyle = '#F44336';
+    ctx.fillRect(ox, barY, barW * (m.hp/m.maxHp), 4);
+  }
+}
+
+// =============================================================
+// SECTION 9: PROJECTILES
+// =============================================================
+let projectiles = [];
+function spawnProjectile(x,y,vx,vy,c,col,dmg) {
+  if (projectiles.length > 80) projectiles.splice(0, 20);
+  projectiles.push({x,y,vx,vy,c,col,dmg,w:12,h:12,life:3,fromPlayer:false});
+}
+
+function updateProjectiles(dt) {
+  for (let i=projectiles.length-1;i>=0;i--) {
+    const p = projectiles[i];
+    if (p.hasGravity) p.vy += GRAVITY * 0.8 * dt;
+    p.x += p.vx*dt;
+    p.y += p.vy*dt;
+    p.life -= dt;
+    if (p.life<=0) { projectiles.splice(i,1); continue; }
+    if (!p.fromPlayer && !player.dead && aabbHit(p.x-6,p.y-6,12,12,player.x,player.y,player.w,player.h)) {
+      hurtPlayer(p.dmg);
+      projectiles.splice(i,1);
+      continue;
+    }
+    const gx = Math.floor(p.x/TILE), gy = Math.floor(p.y/TILE);
+    if (isSolid(gx,gy)) { projectiles.splice(i,1); continue; }
+  }
+}
+
+function renderProjectiles(ctx) {
+  for (const p of projectiles) {
+    const dx = p.x - cam.x + cam.shakeX;
+    const dy = p.y - cam.y + cam.shakeY;
+    atlas.draw(ctx,p.c,14,p.col,dx-7,dy-7);
+  }
+}
+
+// =============================================================
+// SECTION 10: ITEMS ON GROUND (removed 币 and 盾, added 盔)
+// =============================================================
+let items = [];
+function spawnItem(type, x, y, nopickup) {
+  const cols = {'剑':'#B0BEC5','枪':'#607D8B','甲':'#FFD600','鞋':'#E91E63','长':'#9E9E9E',
+    '火':'#FF5722','毒':'#4CAF50','盔':'#FF8F00','钥':'#FDD835','果':'#FF9800',
+    '肉':'#D32F2F','丹':'#E040FB','血':'#C62828','霜':'#4FC3F7'};
+  items.push({type,x,y,vy:0,w:20,h:20,col:cols[type]||'#999',bobT:Math.random()*6,pickupCd:nopickup?0.5:0});
+}
+
+function updateItems(dt) {
+  for (const it of items) {
+    it.bobT += dt;
+    if (it.pickupCd > 0) it.pickupCd -= dt;
+    it.vy += GRAVITY*dt;
+    it.y += it.vy*dt;
+    const gy = Math.floor((it.y+it.h)/TILE);
+    const gx = Math.floor((it.x+it.w/2)/TILE);
+    if (isSolid(gx,gy)||isPlatform(gx,gy)) {
+      it.y = gy*TILE-it.h;
+      it.vy = 0;
+    }
+    if (it.pickupCd <= 0 && aabbHit(it.x,it.y,it.w,it.h,player.x,player.y,player.w,player.h)) {
+      if (canEquip(it.type)) {
+        if (WEAPONS.has(it.type) && player.weapon) {
+          if (input.attackPressed) {
+            equipItem(it.type);
+            addParticle(it.type, it.x, it.y, 0, -60, it.col, 16, 0.5);
+            it.dead = true;
+          }
+        } else {
+          equipItem(it.type);
+          addParticle(it.type, it.x, it.y, 0, -60, it.col, 16, 0.5);
+          it.dead = true;
+        }
+      }
+    }
+  }
+  items = items.filter(i=>!i.dead);
+}
+
+function renderItems(ctx) {
+  for (const it of items) {
+    const dx = it.x - cam.x + cam.shakeX;
+    const dy = it.y - cam.y + cam.shakeY + Math.sin(it.bobT*3)*3;
+    atlas.draw(ctx, it.type, 18, it.col, dx, dy);
+    if (WEAPONS.has(it.type) && player.weapon && it.pickupCd <= 0 &&
+        aabbHit(it.x-10,it.y-10,it.w+20,it.h+20,player.x,player.y,player.w,player.h)) {
+      ctx.save();
+      ctx.globalAlpha = 0.5 + 0.3 * Math.sin(it.bobT*4);
+      atlas.draw(ctx, '攻', 12, '#F44336', dx+2, dy-16);
+      ctx.restore();
+    }
+  }
+}
+
+// =============================================================
+// SECTION 11: SCENE INTERACTIONS
+// =============================================================
+function checkAttackInteract(ax,ay,aw,ah) {
+  const sx = Math.floor(ax/TILE), ex = Math.floor((ax+aw)/TILE);
+  const sy = Math.floor(ay/TILE), ey = Math.floor((ay+ah)/TILE);
+  for (let y=sy-2;y<=ey+2;y++) {
+    for (let x=sx-1;x<=ex+1;x++) {
+      if (x<0||y<0||y>=levelH||x>=levelW) continue;
+      const ch = levelMap[y]?.[x];
+      if (ch==='果') {
+        setTile(x,y,'叶');
+        spawnItem('果', x*TILE, y*TILE);
+      }
+      if (ch==='砖') {
+        setTile(x,y,'。');
+        addParticle('碎', x*TILE+TILE/2, y*TILE+TILE/2, (Math.random()-0.5)*80, -60, '#A1887F', 14, 0.4, 200);
+        addParticle('碎', x*TILE+TILE/2, y*TILE+TILE/2, (Math.random()-0.5)*80, -40, '#A1887F', 12, 0.4, 200);
+      }
+      // Breakable tiles: 草 叶 云 灯 窗
+      const brkDef = TILE_DEF[ch];
+      if (brkDef && brkDef.breakable && ch!=='砖') {
+        setTile(x,y,'。');
+        const bc = brkDef.col || '#999';
+        addParticle('碎', x*TILE+TILE/2, y*TILE+TILE/2, (Math.random()-0.5)*60, -50, bc, 12, 0.4, 150);
+        addParticle(ch, x*TILE+TILE/2, y*TILE+TILE/2, (Math.random()-0.5)*40, -60, bc, 14, 0.35, 100);
+      }
+      if (ch==='箱') {
+        setTile(x,y,'。');
+        const loot = ['果','果','肉','丹','盔'][Math.floor(Math.random()*5)];
+        spawnItem(loot, x*TILE, y*TILE);
+        addParticle('开', x*TILE, y*TILE-10, 0, -40, '#FFC107', 16, 0.5);
+      }
+    }
+  }
+}
+
+function checkInteract() {
+  const cx = Math.floor((player.x+player.w/2)/TILE);
+  const cy = Math.floor((player.y+player.h/2)/TILE);
+  for (let dy=-1;dy<=1;dy++) {
+    for (let dx=-1;dx<=1;dx++) {
+      const gx=cx+dx, gy=cy+dy;
+      if (gx<0||gy<0||gy>=levelH||gx>=levelW) continue;
+      const ch = levelMap[gy]?.[gx];
+      const td = TILE_DEF[ch];
+      if (!td || !td.interact) continue;
+      if (td.interact==='door') {
+        setTile(gx,gy,'。');
+        addParticle('开',gx*TILE,gy*TILE-10,0,-40,'#4CAF50',18,0.6);
+      }
+      if (td.interact==='locked_door' && player.hasKey) {
+        setTile(gx,gy,'门');
+        player.hasKey = false;
+        addParticle('开',gx*TILE,gy*TILE-10,0,-40,'#FFD600',18,0.6);
+      }
+      if (td.interact==='sign') {
+        showMessage(getSignText(gx,gy));
+      }
+    }
+  }
+}
+
+let messageText = '';
+let messageTimer = 0;
+function showMessage(txt) { messageText=txt; messageTimer=3; }
+
+const signTexts = {};
+function setSignText(gx,gy,txt) { signTexts[gx+','+gy]=txt; }
+function getSignText(gx,gy) { return signTexts[gx+','+gy]||'...'; }
+
+function autoInteractDoors() {
+  // Door/路 tiles no longer auto-removed (level transitions use edge detection)
+  // Only handle locked doors
+  const cx = Math.floor((player.x+player.w/2)/TILE);
+  const cy = Math.floor((player.y+player.h/2)/TILE);
+  for (let dy=-1;dy<=1;dy++) {
+    for (let dx=-1;dx<=1;dx++) {
+      const gx=cx+dx, gy=cy+dy;
+      if (gx<0||gy<0||gy>=levelH||gx>=levelW) continue;
+      const ch = levelMap[gy]?.[gx];
+      if (ch==='锁' && player.hasKey) {
+        setTile(gx,gy,'路');
+        player.hasKey = false;
+        addParticle('开',gx*TILE,gy*TILE-10,0,-40,'#FFD600',18,0.6);
+      }
+    }
+  }
+}
+
+// Boss levels: no going back to previous level
+const BOSS_LEVELS = new Set([9, 11, 13]);
+
+let levelExitX = 0, levelExitY = 0;
+function checkLevelExit() {
+  if (levelTransitionCd > 0) return false;
+  const cx = Math.floor((player.x+player.w/2)/TILE);
+  const cy = Math.floor((player.y+player.h/2)/TILE);
+  // For vertical levels, use exit coordinate check
+  if (LEVELS[currentLevel] && LEVELS[currentLevel].vertical) {
+    if (Math.abs(cx-levelExitX)<=1 && Math.abs(cy-levelExitY)<=1) return true;
+    return false;
+  }
+  // For normal levels: player must be at right edge and pressing right
+  if (player.x >= levelW * TILE - player.w - 2 && input.right) return true;
+  // Also check exit coordinates for enclosed levels (door-based exits)
+  if (Math.abs(cx-levelExitX)<=1 && Math.abs(cy-levelExitY)<=1 && input.right) return true;
+  return false;
+}
+
+// Check if player is at the left edge and pressing left → go to previous level
+function checkLevelEntrance() {
+  if (levelTransitionCd > 0) return false;
+  if (currentLevel <= 0) return false;
+  if (BOSS_LEVELS.has(currentLevel)) return false;
+  if (LEVELS[currentLevel] && LEVELS[currentLevel].vertical) return false;
+  // Also block going back from cutscene levels
+  if (LEVELS[currentLevel] && LEVELS[currentLevel].cutscene) return false;
+  // Player within the first two tiles and pressing left
+  if (player.x <= 2 * TILE && input.left) return true;
+  return false;
+}
+
+// =============================================================
+// SECTION 12: HUD
+// =============================================================
+function renderHUD(ctx) {
+  const s = SCALE;
+  const hx = 8, hy = 8;
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillRect(0, 0, GAME_W, 52*s);
+  ctx.fillStyle = '#eee';
+  ctx.fillRect(0, 50*s, GAME_W, 2);
+
+  // Row 1: 生命 + hearts + armor + helmet
+  atlas.draw(ctx,'生',13*s,'#333',hx,hy);
+  atlas.draw(ctx,'命',13*s,'#333',hx+14*s,hy);
+  const hpStart = hx + 30*s;
+  for (let i=0;i<player.maxHp;i++) {
+    const col = i<player.hp ? '#F44336' : '#ddd';
+    atlas.draw(ctx,'血',14*s,col,hpStart+i*16*s,hy);
+  }
+  // Armor indicator
+  let extraX = hpStart + player.maxHp*16*s + 4;
+  if (player.armor > 0) {
+    for (let i=0; i<player.armor; i++) {
+      atlas.draw(ctx,'甲',13*s,'#FFD600',extraX+i*15*s,hy);
+    }
+    extraX += player.armor * 15*s;
+  }
+  // Helmet indicator (after armor)
+  if (player.helmet) {
+    atlas.draw(ctx,'盔',13*s,'#FF8F00',extraX,hy);
+  }
+
+  // Row 2 left: 攻 + damage number
+  atlas.draw(ctx,'攻',11*s,'#666',hx,hy+20*s);
+  atlas.draw(ctx,cnNum(player.damage),11*s,'#333',hx+14*s,hy+20*s);
+
+  // Row 1 right: Level name
+  const lvName = currentLevelName;
+  const lvNameSz = 11*s;
+  const lvNameSpacing = lvNameSz * 1.2;
+  for (let i=0;i<lvName.length;i++) {
+    atlas.draw(ctx,lvName[i],lvNameSz,'#999',GAME_W - lvNameSpacing*(lvName.length-i) - 8,hy+4);
+  }
+
+  // Row 2 right: 武器 + weapon name
+  const wn = getWeaponName();
+  atlas.draw(ctx,'武',11*s,'#666',GAME_W-100*s,hy+22*s);
+  atlas.draw(ctx,'器',11*s,'#666',GAME_W-87*s,hy+22*s);
+  for (let i=0;i<wn.length;i++) {
+    const ch = wn[i];
+    const wc = ch==='火'?'#FF5722':ch==='毒'?'#4CAF50':ch==='霜'?'#4FC3F7':ch==='长'?'#9E9E9E':'#333';
+    atlas.draw(ctx,wn[i],12*s,wc,GAME_W-73*s+i*14*s,hy+22*s);
+  }
+
+  // Story characters (剧情栏)
+  if (storyChars.length > 0) {
+    const stX = GAME_W - 90*s;
+    const stY = hy + 40*s;
+    atlas.draw(ctx,'剧',10*s,'#9C27B0',stX,stY);
+    atlas.draw(ctx,'情',10*s,'#9C27B0',stX+12*s,stY);
+    for (let i=0;i<storyChars.length;i++) {
+      const sc = storyChars[i];
+      const scCol = sc==='龙'?'#FF6D00':'#9C27B0';
+      atlas.draw(ctx,sc,14*s,scCol,stX+28*s+i*18*s,stY-2*s);
+    }
+  }
+
+  // Story char pickup animation
+  if (storyCharAnim) {
+    const sa = storyCharAnim;
+    sa.timer += 0.016;
+    if (sa.phase === 'drop') {
+      sa.y -= 1.5;
+      sa.size = Math.min(48, sa.size + 0.3);
+      if (sa.timer > 1.5) { sa.phase = 'fly'; sa.timer = 0; }
+      atlas.draw(ctx, sa.char, Math.round(sa.size), sa.char==='龙'?'#FF6D00':'#9C27B0', sa.x - cam.x*WORLD_SCALE, sa.y - cam.y*WORLD_SCALE);
+      // Glow
+      if (Math.random()<0.3) addParticle('光', sa.x+(Math.random()-0.5)*20, sa.y+(Math.random()-0.5)*20, (Math.random()-0.5)*30, -30, '#FFD600', 8, 0.3);
+    } else if (sa.phase === 'fly') {
+      const t = Math.min(1, sa.timer / 1.0);
+      const ease = t*t;
+      sa.x += (sa.targetX - sa.x) * ease * 0.15;
+      sa.y += (sa.targetY - sa.y) * ease * 0.15;
+      sa.size = Math.max(14, sa.size - 0.8);
+      atlas.draw(ctx, sa.char, Math.round(sa.size), sa.char==='龙'?'#FF6D00':'#9C27B0', sa.x, sa.y);
+      if (sa.timer > 1.2) storyCharAnim = null;
+    }
+  }
+
+  // God mode indicator
+  if (godMode) {
+    atlas.draw(ctx,'神',12*s,'#FFD700',GAME_W/2-6*s,hy+2);
+    atlas.draw(ctx,'模',12*s,'#FFD700',GAME_W/2+8*s,hy+2);
+    // Show current level / total
+    const info = cnNum(currentLevel) + '/' + cnNum(LEVELS.length-1);
+    const infoSz = 9*s;
+    for (let i=0;i<info.length;i++) {
+      atlas.draw(ctx,info[i],infoSz,'#FFD700',GAME_W/2-((info.length-1)*10*s)/2+i*10*s, hy+18*s);
+    }
+    // Show level input prompt when typing (keyboard)
+    if (godLevelInput.length > 0) {
+      const prompt = '跳转: ' + godLevelInput;
+      const pSz = Math.round(14*s);
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      ctx.fillRect(GAME_W/2-60*s, hy+30*s, 120*s, 22*s);
+      ctx.font = 'bold '+pSz+'px '+FONT_FAMILY;
+      ctx.fillStyle = '#FFD700';
+      ctx.textAlign = 'center';
+      ctx.fillText(prompt + '_', GAME_W/2, hy+46*s);
+      ctx.textAlign = 'start';
+    }
+    // Mobile god mode: show level selector panel
+    if ('ontouchstart' in window) {
+      const pSz = Math.round(13*s);
+      const panelW = 220*s, panelH = 56*s;
+      const px = GAME_W/2 - panelW/2, py = hy + 30*s;
+      ctx.fillStyle = 'rgba(0,0,0,0.75)';
+      ctx.beginPath(); ctx.roundRect(px, py, panelW, panelH, 8*s); ctx.fill();
+      ctx.strokeStyle = '#FFD700'; ctx.lineWidth = 1.5*s;
+      ctx.beginPath(); ctx.roundRect(px, py, panelW, panelH, 8*s); ctx.stroke();
+      // Level name and number
+      const lvName = LEVELS[godMobileLevelSel] ? LEVELS[godMobileLevelSel].name : '?';
+      ctx.font = 'bold '+pSz+'px '+FONT_FAMILY;
+      ctx.fillStyle = '#FFD700';
+      ctx.textAlign = 'center';
+      ctx.fillText('< ' + cnNum(godMobileLevelSel) + ' ' + lvName + ' >', GAME_W/2, py + 22*s);
+      ctx.font = 'bold '+Math.round(10*s)+'px '+FONT_FAMILY;
+      ctx.fillStyle = '#ccc';
+      ctx.fillText('左右=选幕  跳=确认  攻=关闭', GAME_W/2, py + 42*s);
+      ctx.textAlign = 'start';
+    }
+  }
+
+  // Message
+  if (messageTimer > 0) {
+    const ma = Math.min(1, messageTimer);
+    ctx.fillStyle = `rgba(0,0,0,${0.7*ma})`;
+    ctx.fillRect(GAME_W*0.1, GAME_H*0.35, GAME_W*0.8, 40*s);
+    ctx.fillStyle = `rgba(255,255,255,${ma})`;
+    ctx.font = `bold ${14*s}px ${FONT_FAMILY}`;
+    ctx.textAlign = 'center';
+    ctx.fillText(messageText, GAME_W/2, GAME_H*0.35+26*s);
+    ctx.textAlign = 'start';
+  }
+}
+
+function renderTouchButtons(ctx) {
+  if (!('ontouchstart' in window)) return;
+  for (const b of touchBtns) {
+    const bx = b.rx*GAME_W, by = b.ry*GAME_H, bw = b.rw*GAME_W, bh = b.rh*GAME_H;
+    const pressed = touchState[b.id];
+    const r = 8;
+    ctx.beginPath();
+    ctx.roundRect(bx+4, by+4, bw-8, bh-8, r);
+    ctx.fillStyle = pressed ? 'rgba(0,0,0,0.18)' : 'rgba(0,0,0,0.06)';
+    ctx.fill();
+    ctx.strokeStyle = pressed ? 'rgba(0,0,0,0.3)' : 'rgba(0,0,0,0.12)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    const sz = Math.min(28*SCALE, bw*0.45);
+    const col = pressed ? '#333' : '#888';
+    atlas.draw(ctx, b.label, sz, col, bx+bw/2-sz*0.45, by+bh/2-sz*0.45);
+  }
+}
+
+// =============================================================
+// SECTION 12B: DARKNESS / LIGHTING + FOG SYSTEM
+// =============================================================
+function renderDarkness(ctx) {
+  const sx = Math.max(0, Math.floor(cam.x/TILE)-1);
+  const sy = Math.max(0, Math.floor(cam.y/TILE)-1);
+  const ex = Math.min(levelW, Math.ceil((cam.x+GAME_W/WORLD_SCALE)/TILE)+1);
+  const ey = Math.min(levelH, Math.ceil((cam.y+GAME_H/WORLD_SCALE)/TILE)+1);
+
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  for (let y=sy; y<ey; y++) {
+    for (let x=sx; x<ex; x++) {
+      const ch = levelMap[y]?.[x];
+      if (ch === '灯') {
+        const lx = (x*TILE + TILE/2 - cam.x) * WORLD_SCALE + cam.shakeX;
+        const ly = (y*TILE + TILE/2 - cam.y) * WORLD_SCALE + cam.shakeY;
+        const lr = 80 * WORLD_SCALE;
+        const flicker = 1 + Math.sin(Date.now()*0.005 + x*3)*0.08;
+        const r = lr * flicker;
+        const grad = ctx.createRadialGradient(lx, ly, 0, lx, ly, r);
+        grad.addColorStop(0, 'rgba(255,214,0,0.18)');
+        grad.addColorStop(0.4, 'rgba(255,180,0,0.08)');
+        grad.addColorStop(1, 'rgba(255,150,0,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(lx-r, ly-r, r*2, r*2);
+      }
+    }
+  }
+  ctx.restore();
+
+  // Fog overlay when player has fog effect active
+  if (player.inFog && player.fogTimer > 0) {
+    const fogAlpha = Math.min(0.55, player.fogTimer * 0.15);
+    ctx.save();
+    ctx.fillStyle = `rgba(180,180,195,${fogAlpha})`;
+    ctx.fillRect(0, 0, GAME_W, GAME_H);
+    ctx.restore();
+  }
+}
+
+// =============================================================
+// SECTION 13: LEVEL DATA (adjusted maps with new tiles)
+// =============================================================
+let currentLevel = 0;
+let currentLevelName = '';
+
+const LEVELS = [];
+
+// ========== CHAPTER 1: FOREST AWAKENING ==========
+
+
+
+// Level 1
+LEVELS.push({
+  name: '森林',
+  playerStart: [2,9],
+  exit: [58, 9],
+  map: [
+'。。。。。。。。。云云云云。。。。。。。。。云云云。。。。。。。。。。。。云云云云。。。。。。云云云。。。。。。。。。云云云。',
+'。。。。。。。。。。。。。。。。。。。。。。云云云云。。。。。。。云云云云云。。。。。。。叶叶叶叶叶叶。。。。。。。云云。。。',
+'。。。。。。。。。叶叶叶。。。。。。。。。。。。。。。。。。。。。。。。。叶叶叶叶。。。。藤。。干叶叶叶叶。。。。。。。。。。',
+'。。。。。。叶叶叶叶果叶。。。。。。。。。。。。。。。。。。。。。。。。。。干。。。。。。藤枝枝干枝枝。盔。。。。。。。。。。',
+'。。。。。。。。。干。。。。。。。。。。。。。。。叶叶叶干叶干叶。。。。。。干。叶叶。。。叶叶。干。枝枝枝。。。。。。。。。。',
+'。。。。。。。。。干。。。。。。。。。。。。。。叶叶叶干叶。。。。。。。。。干枝枝。。。。。。。干。。。。。。。。。。。。。。',
+'。。。。。。叶叶。干。。。。。。。。。。。。。。。。干干。。。藤。。。。。蛛干。。。。。。。。。干。。。。。。。。。。。。。。',
+'。。。。。。。枝枝干。。。。。。。。。。。。。。。。。干。。。藤土土土土土土土土土土。。。。。。干。。。。。。。。。。。。。。',
+'。。。。。。。。。干。。。。。。。。。。。。。蛇。。。干。猪。藤土土土土土土土土土土土土土。。蛛干。。。。猪。。。。。。。。。',
+'草。草。剑碑。草。干蛇。草。岩桥桥。。。岩草。草。。。干泥泥泥藤土土土土土土土土土土土土土土土土土土土土桥桥桥桥草。。草土土土',
+'土土土土土土土土土土土土土土土水水水水水土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土水水水水水水水水土土',
+'土土土土土土土土土土土土土土土土水水水水水土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土水水水水水水水水水土',
+  ].join('\n'),
+  signs: [[5,9,'按左右移动 上跳跃 攻击敌人']],
+  monsters: [
+
+  ],
+  items: [],
+});
+
+
+
+// Level 2
+LEVELS.push({
+  name: '水森',
+  playerStart: [2,9],
+  exit: [58, 9],
+  map: [
+'。。。云云云。。。。。。。。。。。叶叶叶叶。。。云云云。。。。。。。。。。。。。。云。。。。。。。。。云云云云。。。。。。云',
+'。。云云云。。。。。。。。。。。叶叶叶果叶。。。。。。。。叶叶叶叶叶叶。。。。。。。。。。。。。。叶叶叶。。。。。叶叶。。。',
+'。。。。。。。。。。。。。。。。。。枝枝干。。叶。。。叶藤。。蛇。干叶叶叶叶。。。。。叶叶。。干枝枝叶。。。。。干叶果叶。。',
+'。。。。。。。。。。。。。。。。。。。。干枝枝枝叶。。。藤枝枝枝枝干。。。。叶。。。。。枝枝干。。。。。叶枝枝枝干。。。。。',
+'。。。。。。。。。。。。。。。。。。。干干。。。。。。叶藤。。。。干。蛛。。藤叶。。。叶叶。干。蛛。。。。。。。干枝枝叶。。',
+'。。。。。。。。。。。。。。。。。。。干蛛。。。。。。。藤叶藤。。干枝枝枝枝藤。。。。。。干干枝枝枝叶。。。蛇。干。。。。。',
+'。。。。。。。。。。。。。。。。。。。干枝枝枝叶。。。叶藤。藤枝枝干。。。。藤叶。。。。。干。。。叶。。枝枝枝枝干。。。。。',
+'。。。。。。。。。。。。。。。。。。。干。。叶。。。。。藤。藤。。干。。。。藤。。。枝枝枝干。。。。。叶叶叶。。干枝枝枝枝枝',
+'。。。。。。。。猪。。。。。。。叶枝枝干。。。。。。。。藤叶藤。。干。。。。。。。叶叶。。干。。。。。。。。。。干。。。。。',
+'土土土土泥泥泥泥泥泥草。。妖。。。。。干。。。。。。。。藤。藤。箱干土。。。。。。。。。。干土。。。。。。。。干干。。。。。',
+'土土土土土土土土土土土土土土水水水水水干土泥水水水水水水水水水泥土土土土水水水水水水水水土土土土土土岩。。。干干。。。。。。',
+'土土土土土土土土土土土土土水水水水水水土土土泥水水水水水水水泥土土土土土土水水水水水水土土土土土土土土土岩水干岩。。。。。。',
+  ].join('\n'),
+  signs: [[]],
+  monsters: [],
+  items: [],
+});
+
+
+// Level 3
+LEVELS.push({
+  name: '瀑布桥',
+  playerStart: [2,5],
+  exit: [58, 9],
+  map: [
+'。。藤。。。。。。。。。。。。。。。水水水水。。。。水水。。。。。。。云云云。。。。。。。。。。。。云砖岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩',
+'。。藤。。。。。。。。。。。。。。。水水水。。。。。水水。。。。云云云云。。。。。。。。。。云云云云云砖岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩',
+'。。藤。。。。。。。。。。。。。雾。水水水。雾雾雾。水。。。。。。。。。。。。。。。。。。。。。。。。。。。。。砖岩岩岩岩岩岩岩岩岩岩岩',
+'。。。藤。。。蝠。。。。。。。。。。水水。。。。。。水。。。。。。。。。。。。。。。。。。。。。。。。。。。。。砖岩岩岩岩岩岩岩岩岩岩岩',
+'。。。。藤。。。。。。。。。桥桥。桥水水桥桥桥。。桥水。桥。妖。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。砖岩岩岩岩岩',
+'。。。枝枝藤藤。。。。桥桥岩岩。。岩水岩岩。。。。岩水。梯。桥。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。砖岩岩岩岩岩',
+'。砖枝。。。。藤藤。桥桥岩。。雾雾。水水岩。。。雾岩水。梯岩岩桥桥。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'枝枝。。。。。。岩岩。藤。。。。。。水水。。。雾。水。。梯。。。岩岩岩。。。。。。蛇。。。。。。。。。。。。。。。。。雷。。。。。。。。',
+'。。。。。。。。岩岩岩藤。。。。。雾。水。。。。。水。。梯。。。。岩岩岩岩岩岩岩土土岩岩岩岩冰冰冰砖岩冰冰冰冰冰岩岩岩岩岩岩岩岩岩岩岩岩',
+'。。。。。。。。。。。藤。。。。。。。水雾雾雾雾。水雾。梯甲。。岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩箱岩岩岩岩岩岩岩岩岩岩岩岩土岩岩岩岩土',
+'。。。。。。。。。。。。藤。。。。雾雾水。。。。。水。。岩岩。。。。。岩岩岩岩岩岩土土土岩岩岩土土土土土土土土土土土土土土土土土土土土土',
+'。。。。。。。。。。。。。藤。。。。。水。。。雾雾水。。。。。。。。。。。。。。岩岩岩土土岩岩岩土土土土土土土土土土土土土水水水土土土土',
+  ].join('\n'),
+  signs: [],
+  monsters: [],
+  items: [],
+});
+
+// ========== CHAPTER 2: DARK CAVE ==========
+
+// Level 4
+LEVELS.push({
+  name: '冰封甬道',
+  playerStart: [2,8],
+  exit: [58, 9],
+  map: [
+'岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩冰冰冰冰冰冰冰冰冰冰冰冰冰岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩',
+'岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩冰冰冰冰冰冰冰。。。刺冰冰冰冰。。刺。。冰冰冰冰冰冰冰冰。。。。。。冰冰冰冰冰。。。。',
+'岩岩岩岩岩岩岩岩岩岩岩岩岩。。。。。刺。。。。。。。。。。。。。。。。。。。。。。。。。蝠。。盔。。。。。刺。。。。。',
+'岩岩岩岩岩岩岩岩岩岩岩。。。。。。。。灯。。。。。。。。。。。灯。。。。。。。。。。。。。。。冰冰。。。。。。灯。。。',
+'岩岩岩岩岩岩岩岩岩。。。。箱。。。。。。。。。。。。灵。。。。。。。。。。。。雾雾。。影冰。。。。。。。。。。。。。。',
+'岩岩岩岩岩岩岩。。。。冰冰冰。。。。。。。。。冰冰。。。雾。。。冰冰冰。。冰。冰冰冰冰冰。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。冰冰。。。。。。。冰冰。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。冰。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'岩岩岩岩岩岩岩。。。。。。雾。。。。。。。。冰影。。。。。。。冰冰。。。。魔。。。。。。。。。。。。。。灵雾雾。。。。',
+'岩岩岩岩岩岩岩岩岩刺。。冰冰。。。。魔。。冰冰冰冰冰。。冰冰冰冰冰冰冰冰冰冰冰。。。冰岩岩弹刺刺。。冰冰冰冰冰冰。。。',
+'岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩',
+'岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩',
+  ].join('\n'),
+  signs: [],
+  monsters: [],
+  items: [],
+});
+
+
+// Level 5: 
+LEVELS.push({
+  name: '深渊',
+  vertical: true,
+  playerStart: [1, 9],
+  exit: [20, 29],
+  map: [
+'岩岩岩岩岩岩岩岩岩岩岩岩岩岩。。。。。。。',
+'岩。。。。。。灯。。岩岩岩岩。。。。。。。',
+'。。。。。。。。。。。。。岩岩岩。。。。。',
+'。。。。。。。忍。。。。。。灯岩岩。。。。',
+'。。。。岩岩桥桥桥桥。。。。丹岩。。。。。',
+'。。。岩岩灯。。。。。。岩岩岩岩。。。。。',
+'。。。。岩岩。。。。。。。。。岩。。。。。',
+'。。。。岩岩。。。。。。蛛。岩岩。。。。。',
+'。剑。岩岩。。。。。岩岩岩岩岩。。。。。。',
+'岩岩弹岩。。。。砖砖砖岩岩岩。。。。。。。',
+'岩岩岩岩盔。。。。岩岩岩岩。。。。。。。',
+'岩岩岩岩砖砖。。。。。。灯岩岩。。。。。。',
+'岩灯。。。。。。。蛛。。。岩岩岩。。。。。',
+'岩。。。。。。。桥桥桥。。。砖砖岩。。。。',
+'岩。。。。蝠。。。。。。。。砖箱岩岩。。。',
+'岩。。砖砖砖桥。。。。。。法砖岩岩。。。。',
+'岩灯。。。。。。。。砖砖砖岩岩。。。。。。',
+'岩岩岩。。。。。。。。岩岩岩岩。。。。。。',
+'岩。。。。。魔。。。。。灯岩岩。。。。。。',
+'岩。。。砖砖砖砖砖。。。。岩。。。。。。。',
+'岩岩岩岩岩。。。。。。。。岩岩岩岩。。。。',
+'岩灯。。。。。。。。岩岩岩岩岩岩岩岩。。。',
+'岩。。。。。。。。。。。。。灯岩岩岩。。岩', 
+'岩。。。。。。骷。。。。。。。岩岩岩岩岩岩',
+'岩盔。。。砖岩岩岩岩砖。。。岩岩岩岩岩岩岩',
+'岩桥。。。。。。。。。。。。。。。。。。。',
+'岩。。桥。。。。。。。。。。。。。。。。。',
+'岩。。。。桥。。。。。。。。。。。。。。。',
+'岩。。。法。。。。。。。。。。骷。。。。。',
+'岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩',
+  ].join('\n'),
+  signs: [],
+  monsters: [],
+  items: [
+  ],
+});
+
+
+// Level 6 
+LEVELS.push({
+  name: '骨殿',
+  playerStart: [1, 5],
+  exit: [61, 11],
+  map: [
+'岩岩岩岩岩岩岩。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'岩岩岩。。。。。骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨。。。。。',
+'。。。。。。。。。。。骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨骨。。。。。。。。',
+'。。。。。。。。。。。。。。。骨。。。。。骨。。。。。骨骨。。。。。。。骨骨。。。。。骨。。。。。骨。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。骨。。灯。。骨。。灯。。骨骨。。。灯。。。骨骨。。灯。。骨。。灯。。骨。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。骨。。。。。骨。。。。。骨盔。。。。。。。甲骨。。。。。骨。。。。。骨。。。。。。。。。。。。',
+'岩岩。。。。。。。。。。。。。骨。。。。。骨。。。。。骨骨。。。。。。。骨骨。。。。。骨。。。。。骨。。。。。。。。。。。。',
+'岩岩岩岩。。。。。。。。。。。骨。。。。。骨。。。。。骨骨。。。将。。。骨骨。。。。。骨。。。。。骨。。。。。。。。。。。。',
+'岩岩岩岩岩岩。。。。。。。。。骨。。。。。骨。。。。。骨骨。灰骨骨骨灰灰骨骨。。。。。骨。。。。。骨。。。。。。。。。。。。',
+'岩岩岩岩岩岩岩岩。。。。。。。骨。。。。。骨。。影。。骨岩岩岩岩岩岩岩岩岩骨。。忍。。骨。。。。。骨。。。。。。。。。。。。',
+'岩岩岩岩岩岩岩岩岩岩。。。。。岩。。骷。。岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩。。法。。骨。。骷。。。。。箱。。。',
+'岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩熔熔熔岩岩岩岩',
+  ].join('\n'),
+  signs: [[1,9,'无数勇者长眠于此']],
+  monsters: [
+  ],
+  items: [],
+});
+
+
+// ========== CHAPTER 3: VOLCANO & DRAGON DOMAIN ==========
+
+// Level 7: Lava Path
+LEVELS.push({
+  name: '熔岩之路',
+  playerStart: [1, 11],
+  exit: [61, 10],
+  map: [
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。熔熔岩岩岩岩岩岩岩岩岩熔熔岩岩岩岩。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。熔熔。。。。。熔熔。。。。。。。。。。火灰灰。。。。。。。',
+'。。。。。。。。。。。岩岩。。。。。。。。。。。。。。。。。。熔熔。。。。。熔熔。。。。灰灰果。。枝枝枝。。。。。。。。',
+'。。。。岩熔岩岩。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。熔熔。。。。。枝枝。。干。。。。。。。。。。',
+'。。长。。。。。。。。。。。。岩岩。。。。。。。。。。。。。。。。。。。。熔熔熔熔熔。。灰灰枝枝干干。。灰灰。。。。。。',
+'。。岩岩。。。。。。。。。岩岩熔熔。。。法。。梯。。。。。。。。。。。。熔岩岩岩岩熔。。。。。。干。。枝枝灰灰。。。。。',
+'。。。。。。。。。梯。。。。。熔熔。。岩岩。岩梯。。。。。。。。。。。。。。。。。。。。。。。。干枝枝灰灰。。。。。。。',
+'。。。。。。。。。梯岩岩。。。熔熔。。熔熔熔熔梯。。。。。。。。。。。。。。。。。。。。。灰灰枝干。。。。。。。。。。。',
+'。。。。。。。。。梯。。。。。熔熔。。熔熔熔。梯。。。。。。。。。。。。。。。。。。。。灰灰枝。干。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。熔熔。。熔熔熔。。。。。。。。。。。。。。。。。。。。。。。。。。干影。。。。。。。。。。',
+'。。。岩岩熔熔岩。炎。。。箱。熔熔。。熔熔。盔。。。。炎。。岩岩岩。。。。岩岩岩岩。。。岩岩岩岩干岩岩岩岩岩岩岩岩岩。。',
+'岩岩岩岩岩熔熔岩岩岩熔熔熔岩熔熔熔熔熔熔熔岩岩岩岩岩岩熔熔熔岩岩岩岩岩熔熔岩岩岩岩熔岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩',
+  ].join('\n'),
+  signs: [],
+  monsters: [
+  ],
+  items: [
+  ],
+});
+
+
+
+// Level 8: Dragon Bone Wastes (fire rain + dark sky)
+LEVELS.push({
+  name: '龙祭台',
+  playerStart: [1, 11],
+  exit: [64, 11],
+  weather: 'fireRain',
+  darkSky: true,
+  map: [
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。灯。。。。。。。。。。。。。。。。灯。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。灯。灯。。。。。。。。灯。灯。。。。。。柱。。。。。。。。。。。。。。。。柱。。。。。。。灯。。。。。。。。。',
+'。。。。。。。。。。柱。柱。。。。。。。。柱。柱。。。。。。柱。。。。。。。。。。。。。。。。柱。。。。。。。柱。。。。。。。。。',
+'。。。。。。。。。。柱。柱。。。。。。。。柱。柱。。。。。。柱。。。。。。。。。。。。。。。。柱。。。。。。。柱。。。。。。。。。',
+'。。。。。。。。。梯柱。柱。。。。。。。。柱箱柱。。。。。。柱。。。。。。。。傀。。。。。。。柱梯。。。。。。柱。。。。。。。。。',
+'。。。。。。。。。梯岩岩岩。。。。。。。。岩岩岩。。。。。。岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩梯。。。。。。岩岩。。。。。。。。',
+'。。。。。。。。。梯柱柱柱。桥桥桥。桥。。柱柱柱。桥桥桥。。骨骨骨骨骨骨柱柱。。柱柱骨骨骨骨骨骨梯。。。。。。柱柱。。。。。。。。',
+'。。。。。。。。。梯。柱。。。。。。。。。。柱。。。。。。。。。。。。。岩柱柱柱柱岩。。。。。。梯。。。。。。。柱。。。。。。。。',
+'。。。。。。。。。梯。柱。。。。。。。。。。柱。。。。。。。。。。。。。。岩柱柱岩。。。。。。。。。。。。。。。柱。。。。。。。。',
+'。。。。碑。。。。。柱柱柱。。。骷。。。。柱柱柱。。。。。。法。。。甲。。岩柱柱岩。。毒。。。法。。。。。。。柱柱柱柱灯。。。。。',
+'岩岩岩岩岩土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土土岩岩岩岩岩岩岩岩岩岩岩岩岩岩',
+  ].join('\n'),
+  signs: [[4,10,'此乃祭龙之所']],
+  //    signs: [[4,9,'勇者皆葬于此']],
+
+  monsters: [
+  ],
+  items: [
+  ],
+});
+
+// Level 9: Fire Dragon Lair (Boss)
+LEVELS.push({
+  name: '火龙巢',
+  playerStart: [2, 11],
+  exit: [31, 2],
+  weather: 'fireRain',
+  darkSky: true,
+  map: [
+'。岩岩岩。。。。。。。。。。。。。。。藤。。。。。。。。。。。。',
+'。。岩岩岩藤。。。。。。。。。。。。藤。。。。。果。。。。。。。',
+'。。。岩岩藤。。。。。。。。。。。。藤。。。枝枝枝枝枝。。。。。',
+'。。岩岩。。藤。。。。。。。。。。藤枝枝枝枝。。。。。岩岩岩岩岩',
+'。。岩岩。。。藤。。。。。。。。。藤。。。。。。。。。岩岩岩岩岩',
+'岩岩岩。果枝枝。藤。。。。龙。。藤。。。。。。。。。。。岩岩。。',
+'岩岩。。枝。。。藤。。。。枝枝枝藤。。。。。。。。。岩岩岩。。。',
+'岩。。。。。。。。藤。枝枝。。。。藤。。。。。。。。。岩岩。。。',
+'。。。。。。果。枝枝藤。。。。。。。藤。。。。。。。。。岩岩。。',
+'。。。。。。枝枝。。藤。。。。。。。藤。。。。。。。。。岩岩。。',
+'。。。。。。。。。。。藤。。。。。。。藤。。。。火。。。。岩。。',
+'岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩。。',
+  ].join('\n'),
+  signs: [[]],
+  monsters: [
+  ],
+  items: [
+  ],
+});
+
+// ========== CHAPTER 4: DEMON KING'S PATH ==========
+
+// Level 10: Undead Swamp
+LEVELS.push({
+  name: '亡灵沼泽',
+  playerStart: [1, 5],
+  exit: [60, 10],
+  map: [
+'。。。。。。。。。。。。。。。雾雾。雾雾雾雾。雾雾雾。。。雾雾。。。雾雾。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。雾雾。。。。。雾。。。。。雾。。。。。雾雾。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。。雾雾。。。。。雾。。。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。蟒。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。桥桥桥桥。。桥桥桥。。桥桥桥桥桥。。。。。。雾雾。。。。。。。。。。。。。。。。。。。。。。',
+'。。剑。。。。。。。。。。。。雾雾柱。。。。柱雾雾。。柱雾雾。。。。桥。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'灰灰灰灰灰灰灰。。。。。。桥桥。雾柱。刺。。柱。。。。柱雾。。。。枝刺。雾。。桥桥。。。。。。。。。。。。。。。。。。。。',
+'骨骨骨骨骨箱骨灰。。。。。柱。。。柱。。枝甲柱。枝刺。柱刺枝。。枝枝。。。。。。柱。。。。。。。。。。。。。。。。。。。。',
+'骨骨骨骨骨骨骨骨灰。骷。岩岩。。雾柱。。。枝枝枝雾。。柱。枝。枝。。。。雾。。。岩岩。。。。忍。。。。。将。。。。。。。。',
+'岩岩岩岩岩土土土土土土岩岩岩泥泥泥柱泥泥泥泥枝泥泥泥泥柱泥泥枝泥泥泥泥泥泥泥泥泥岩岩土土土土土土土岩岩岩岩岩岩岩岩箱岩岩岩',
+'岩岩岩土土土土土土土土土土土沼沼沼柱沼沼沼沼沼枝沼沼沼柱沼沼枝沼沼沼沼沼沼沼沼沼土土土土土土土土土土土土土岩岩岩岩岩岩岩岩',
+  ].join('\n'),
+  signs: [[0,9,'亡灵在沼泽中游荡']],
+  monsters: [
+  ],
+  items: [],
+});
+
+
+// Level 11: Demon King's Throne (Boss)
+LEVELS.push({
+  name: '魔王殿',
+  playerStart: [2, 10],
+  exit: [26, 8],
+  map: [
+'岩岩岩岩岩岩岩。。。。。。。。。。。。。。。。岩岩岩岩岩岩岩岩',
+'柱。。。。。岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩。。。。。柱',
+'柱。。。。。。。。。柱。。。。。。。。。柱。。。。。。。。。柱',
+'柱。。。灯。。。。。柱。。。。灯。。。。柱。。。。。灯。。。柱',
+'柱。。。。。。。。。柱。。。。。。。。。柱。。。。。。。。。柱',
+'柱。。。。。。。。。柱。。。。。。。。。柱。。。。。。。。。柱',
+'柱。。。。。。。。。柱。。。。丹。。。。柱。。。。。。。。。柱',
+'柱。。。。。。。。。柱岩岩岩岩岩岩岩岩岩柱。。。。。。。。。柱',
+'柱。。。。桥桥桥桥。柱。。。。。。。。。柱。桥桥桥桥。。。。柱',
+'柱。。。桥。。。。。柱。。。。。。。。。柱。。。。。桥。。。柱',
+'柱。。。。。。。。。柱。。。。甲。。。。柱。。。。。。。。。柱',
+'岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩',
+  ].join('\n'),
+  signs: [[1,8,'魔王在此 决一死战！']],
+  monsters: [
+    ['魔王', 14, 6],
+  ],
+  items: [
+  ],
+});
+
+// Level 12: Fusion Cutscene (no map, pure animation)
+LEVELS.push({
+  name: '魔龙降世',
+  cutscene: 'fusion',
+  playerStart: [0, 0],
+  exit: [0, 0],
+  map: '。',
+  signs: [],
+  monsters: [],
+  items: [],
+});
+
+
+
+// Level 13: Final Battle - Enhanced Dragon Boss
+LEVELS.push({
+  name: '终焉之战',
+  playerStart: [14, 10],
+  exit: [26, 8],
+  bgColor: '#D28B84',
+  darkSky: true,
+  weather: 'fireRain',
+  map: [
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。。。。。。。。。。。。。。。。。。。。。。。。。',
+'。。。灰灰灰灰火灰灰灰。。。。。灰灰灰灰灰毒灰灰灰。。',
+'。。。桥桥桥桥桥桥桥桥。。。。。桥桥桥桥桥桥桥桥桥。。',
+'。。桥。。。。。。。。桥。。。。桥。。。。。。。。柱。。',
+'灰灰柱灰灰灰灰箱灰灰灰柱灰甲灰柱灰灰箱灰灰灰灰灰柱灰灰',
+'岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩岩',
+  ].join('\n'),
+  signs: [[1,8,'魔龙降世 最终决战！']],
+  monsters: [
+    ['魔龙', 14, 5],
+  ],
+  items: [
+  ],
+});
+
+function startLevel(idx) {
+  if (idx >= LEVELS.length) { scene = 'victory'; return; }
+  // Check if this level is a cutscene trigger
+  const lv = LEVELS[idx];
+  if (lv.cutscene === 'fusion') {
+    currentLevel = idx;
+    currentLevelName = lv.name;
+    startFusionCutscene();
+    return;
+  }
+  currentLevel = idx;
+  currentLevelName = lv.name;
+  loadLevel(lv.map);
+  player.x = lv.playerStart[0]*TILE;
+  player.y = lv.playerStart[1]*TILE - player.h;
+  player.vx = 0; player.vy = 0;
+  player.fogTimer = 0; player.inFog = false;
+  player.hurtTimer = 0; player.dead = false;
+  player.onIce = false; player.mudSlow = 0; player.windForce = 0;
+  player.poisonTimer = 0;
+  player.dashState = 'none'; player.dashTimer = 0; player.dashCooldown = 0;
+  player.plungeState = 'none'; player.plungeTimer = 0; player.attackHoldTime = 0;
+  levelExitX = lv.exit[0];
+  levelExitY = lv.exit[1];
+
+  // Apply weather/atmosphere from level config
+  resetWeather();
+  if (lv.weather) weatherState.type = lv.weather;
+  if (lv.darkSky) weatherState.darkSky = true;
+  if (lv.bgColor) weatherState.bgColor = lv.bgColor;
+
+  monsters = [];
+  for (const [type,mx,my] of mapMonsters) {
+    monsters.push(createMonster(type, mx*TILE, my*TILE-32));
+  }
+  for (const [type,mx,my] of (lv.monsters||[])) {
+    monsters.push(createMonster(type, mx*TILE, my*TILE-32));
+  }
+  items = [];
+  for (const [type,ix,iy] of mapItems) {
+    spawnItem(type, ix*TILE, iy*TILE);
+  }
+  for (const [type,ix,iy] of (lv.items||[])) {
+    spawnItem(type, ix*TILE, iy*TILE);
+  }
+  projectiles = [];
+  particles.length = 0;
+  for (const [sx,sy,txt] of (lv.signs||[])) {
+    setSignText(sx,sy,txt);
+  }
+
+  // Enhance final boss 
+  if (idx === LEVELS.length - 1) {
+    for (const m of monsters) {
+      if (m.type === '魔龙') {
+        m.hp = 40;
+        m.maxHp = 40;
+      }
+    }
+  }
+
+  scene = 'gameplay';
+  levelNameTimer = 3; // show level name overlay for 3 seconds
+  levelTransitionCd = 0.5; // prevent immediate re-trigger
+  // Snap camera instantly to player position (no smooth pan)
+  cam.snap(player.x+player.w/2, player.y+player.h/2, levelW*TILE, levelH*TILE);
+}
+
+// Start a level but place player at the right end (for going back)
+function startLevelFromEnd(idx) {
+  if (idx < 0) return;
+  startLevel(idx);
+  const lv = LEVELS[idx];
+  const spawnY = lv.exit ? lv.exit[1] : (lv.playerStart ? lv.playerStart[1] : 5);
+  // Use exit X coordinate if it's an enclosed level (exit not at right edge)
+  let spawnX;
+  if (lv.exit && lv.exit[0] < levelW - 2) {
+    spawnX = lv.exit[0];
+  } else {
+    spawnX = levelW - 2;
+  }
+  player.x = spawnX * TILE;
+  player.y = spawnY * TILE - player.h;
+  player.vx = 0; player.vy = 0;
+  // Open any door tile at exit so player isn't stuck
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const gx = spawnX + dx, gy = Math.floor(spawnY) + dy;
+      if (gx >= 0 && gy >= 0 && gy < levelH && gx < levelW) {
+        const ch = levelMap[gy] && levelMap[gy][gx];
+        if (ch === '门' || ch === '路' || ch === '锁') {
+          setTile(gx, gy, '。');
+        }
+      }
+    }
+  }
+  // Re-snap camera to new position
+  cam.snap(player.x+player.w/2, player.y+player.h/2, levelW*TILE, levelH*TILE);
+}
+
+// =============================================================
+// SECTION 14: SCENE MANAGER
+// =============================================================
+let scene = 'title';
+let introTimer = 0;
+let levelNameTimer = 0; // countdown for level name overlay in gameplay
+let lavaDripTimer = 0; // global timer for lava drip spawning
+let levelTransitionCd = 0; // cooldown to prevent immediate re-triggering
+let titleBlink = 0;
+let menuState = 'main'; // 'main' | 'controls'
+let menuSel = 0; // current menu selection index
+
+function updateTitle(dt) {
+  titleBlink += dt;
+}
+
+function drawTextLine(ctx, txt, sz, col, x, y, alpha) {
+  for (let i=0;i<txt.length;i++) {
+    atlas.draw(ctx, txt[i], sz, col, x+i*sz*1.05, y, alpha||1);
+  }
+}
+
+function renderTitle(ctx) {
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0,0,GAME_W,GAME_H);
+  const s = SCALE;
+
+  if (menuState === 'main') {
+    const t = titleBlink;
+
+    // ---- Static title: 文字冒险游戏 (black, large, moved down) ----
+    const title = '文字冒险游戏';
+    const titleSz = 36*s;
+    const titleSpacing = titleSz * 1.05;
+    const titleTotalW = title.length * titleSpacing;
+    const titleX0 = GAME_W/2 - titleTotalW/2;
+    const titleY = GAME_H*0.25;
+    for (let i=0;i<title.length;i++) {
+      atlas.draw(ctx, title[i], titleSz, '#111', titleX0 + i*titleSpacing, titleY);
+    }
+    // English subtitle
+    ctx.fillStyle = '#999';
+    ctx.font = `${11*s}px ${FONT_FAMILY}`;
+    ctx.textAlign = 'center';
+    ctx.fillText('Chinese Character Action Adventure', GAME_W/2, titleY + titleSz + 10*s);
+    ctx.textAlign = 'start';
+
+    // ---- Dragon boss (top-right of title text) ----
+    const drOx = titleX0 + titleTotalW - 20*s;
+    const drOy = titleY - 70*s + Math.sin(t*2)*4*s;
+    const drCx = 40;
+    const drSk = 0;
+    const drGlow = '#B71C1C';
+    // Wing fold animation
+    const drWp = 0.35 + Math.sin(t*1.2)*0.1;
+    const drWBeat = Math.sin(t*3)*3;
+    // Wing triangle geometry (same as game)
+    const drSz = 14*s/SCALE; // match game size relative
+    const drG = drSz * 1.3;
+    const drHypLen = drG * 6;
+    const drSF = drHypLen * 3/4;
+    const drFT = drHypLen / 4;
+    const drRh = drHypLen * Math.sqrt(3)/4;
+    const drFoldInner = (1-drWp)*Math.PI*0.5;
+    const drFoldOuter = (1-drWp)*Math.PI*0.45;
+    const drRotP = (px,py,pivX,pivY,ang) => {
+      const dx=px-pivX, dy=py-pivY;
+      const c=Math.cos(ang), sn=Math.sin(ang);
+      return [pivX+dx*c-dy*sn, pivY+dx*sn+dy*c];
+    };
+    const drCols = ['#1A0000','#2D0000','#440000','#5C0000','#700000','#8B0000','#A01010'];
+    const drawTitleWing = (dir, sx, sy) => {
+      for (let r=0;r<4;r++) {
+        const rf=r/3;
+        const baseX=drSF*rf;
+        const colH=drRh*(baseX/drSF);
+        const nV=Math.max(1,Math.round(colH/drG));
+        for (let v=0;v<nV;v++) {
+          const vf=nV>1?v/(nV-1):0;
+          let px=baseX, py=-colH*vf;
+          [px,py]=drRotP(px,py,px,0,drFoldInner);
+          const ci=Math.min(drCols.length-1,Math.floor(rf*3+vf*3));
+          atlas.draw(ctx,'翼',drSz,drCols[ci],sx+px*dir,sy+py+drWBeat*(1-rf)*0.5,0.8);
+        }
+      }
+      for (let r=0;r<3;r++) {
+        const rf=r/2;
+        const baseX=drSF+drFT*rf;
+        const colH=drRh*(1-rf);
+        const nV=Math.max(1,Math.round(colH/drG));
+        for (let v=0;v<nV;v++) {
+          const vf=nV>1?v/(nV-1):0;
+          let px=baseX, py=-colH*vf;
+          [px,py]=drRotP(px,py,px,0,drFoldOuter);
+          const ci=Math.min(drCols.length-1,Math.floor((rf+1)*2+vf*2));
+          atlas.draw(ctx,'翼',drSz,drCols[ci],sx+px*dir,sy+py+drWBeat*(1-rf)*0.4,0.75);
+        }
+      }
+    };
+    const drWsy = drOy + 24;
+    drawTitleWing(-1, drOx+drCx-14, drWsy+drWBeat*0.05);
+    drawTitleWing(1, drOx+drCx+14, drWsy-drWBeat*0.05);
+    // Body layout (same as game)
+    atlas.draw(ctx,'角',14,'#FF6F00', drOx+drCx-16, drOy+0);
+    atlas.draw(ctx,'角',14,'#FF6F00', drOx+drCx+4, drOy+0);
+    atlas.draw(ctx,'魔',26,'#111', drOx+drCx-26, drOy+12);
+    atlas.draw(ctx,'龙',26,drGlow, drOx+drCx+0, drOy+12);
+    atlas.draw(ctx,'鳞',14,'#8B0000', drOx+drCx-22, drOy+38);
+    atlas.draw(ctx,'鳞',14,'#6D0000', drOx+drCx-6, drOy+38);
+    atlas.draw(ctx,'鳞',14,'#8B0000', drOx+drCx+10, drOy+38);
+    atlas.draw(ctx,'爪',16,'#D32F2F', drOx+drCx-20, drOy+52);
+    atlas.draw(ctx,'爪',16,'#D32F2F', drOx+drCx+8, drOy+52);
+    const drTailWave = Math.sin(t*4)*5;
+    atlas.draw(ctx,'尾',16,'#C62828', drOx+drCx-28, drOy+40+drTailWave);
+    atlas.draw(ctx,'尾',16,'#A01010', drOx+drCx-42, drOy+42+drTailWave*1.3, 0.9);
+
+    // ---- Player character (centered below title, walking) ----
+    const pWalkRange = titleTotalW * 0.4;
+    const pWalkCenter = GAME_W/2;
+    const pWalkX = pWalkCenter + Math.sin(t*0.6) * pWalkRange;
+    const pOx = pWalkX - 14;
+    const pOy = titleY + titleSz + 28*s;
+    const pSz = 13;
+    const pHSz = 16;
+    const pBob = Math.abs(Math.sin(t*3))*2;
+    const pLeg = Math.sin(t*4)*3;
+    const pCx = pOx + 14;
+    const pFacing = Math.cos(t*0.6) >= 0 ? 1 : -1;
+    // Head
+    atlas.draw(ctx,'头',pHSz,'#4E342E', pCx-pHSz/2, pOy+pBob);
+    // Body
+    atlas.draw(ctx,'身',pSz,'#1565C0', pCx-pSz/2, pOy+pHSz+pBob);
+    atlas.draw(ctx,'体',pSz,'#1565C0', pCx-pSz/2, pOy+pHSz+pSz+pBob);
+    // Hands (offset based on facing direction)
+    atlas.draw(ctx,'手',pSz,'#4E342E', pCx-pSz/2-pSz, pOy+pHSz+pBob);
+    atlas.draw(ctx,'手',pSz,'#4E342E', pCx+pSz/2, pOy+pHSz+pBob);
+    // Sword (火剑) in leading hand, with swing
+    const sAngle = Math.sin(t*3)*0.3 - 1.05;
+    const swordHandX = pFacing === 1 ? pCx+pSz/2+pSz : pCx-pSz/2-pSz;
+    ctx.save();
+    ctx.translate(swordHandX, pOy+pHSz+pSz/2+pBob);
+    ctx.scale(pFacing, 1);
+    ctx.rotate(sAngle);
+    atlas.draw(ctx,'火',pSz,'#FF5722', 0, -pSz/2);
+    atlas.draw(ctx,'剑',pSz,'#B0BEC5', pSz, -pSz/2);
+    ctx.restore();
+    // Feet walking
+    atlas.draw(ctx,'脚',pSz,'#4E342E', pCx-pSz+pLeg, pOy+pHSz+pSz*2+pBob);
+    atlas.draw(ctx,'脚',pSz,'#4E342E', pCx-pLeg, pOy+pHSz+pSz*2+pBob);
+
+    // ---- Menu buttons (larger) ----
+    const items = ['开始游戏','操作说明'];
+    const btnSz = 22*s;
+    const btnY0 = GAME_H * 0.52;
+    const btnGap = 46*s;
+    for (let i=0;i<items.length;i++) {
+      const by = btnY0 + i * btnGap;
+      const txt = items[i];
+      const tw = txt.length * btnSz * 1.05;
+      const bx = GAME_W/2 - tw/2;
+      const sel = (i === menuSel);
+      if (sel) {
+        ctx.fillStyle = '#FFF3E0';
+        ctx.fillRect(bx-10*s, by-5*s, tw+20*s, btnSz+12*s);
+        ctx.strokeStyle = '#FF9800';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(bx-10*s, by-5*s, tw+20*s, btnSz+12*s);
+      }
+      const col = sel ? '#E65100' : '#555';
+      drawTextLine(ctx, txt, btnSz, col, bx, by);
+    }
+
+  } else if (menuState === 'controls') {
+    // ---- Controls screen ----
+    drawTextLine(ctx, '操作说明', 22*s, '#333', GAME_W/2-22*s*1.05*2, GAME_H*0.08);
+
+    const isMobile = 'ontouchstart' in window;
+    const controls = isMobile ? [
+      ['左 / 右', '移动'],
+      ['跳', '跳跃/攀爬'],
+      ['攻', '攻击 / 互动'],
+      ['空中长按 攻', '蓄力下砸'],
+    ] : [
+      ['← → / A D', '移动'],
+      ['↑ / W / 空格', '跳跃/攀爬'],
+      ['Z / J', '攻击 / 互动'],
+      ['空中长按攻击键', '蓄力下砸'],
+    ];
+    const cy0 = GAME_H * 0.22;
+    const rowH = 36*s;
+    for (let i=0;i<controls.length;i++) {
+      const ry = cy0 + i * rowH;
+      ctx.fillStyle = '#999';
+      ctx.font = `${13*s}px ${FONT_FAMILY}`;
+      ctx.textAlign = 'left';
+      ctx.fillText(controls[i][0], 30*s, ry + 14*s);
+      drawTextLine(ctx, controls[i][1], 14*s, '#333', GAME_W/2 + 10*s, ry);
+    }
+    ctx.textAlign = 'start';
+
+    // Tips
+    const tips = ['收集武器词缀提升攻击力','穿戴盔和甲抵挡伤害','挑战最终boss'];
+    const tipY0 = GAME_H * 0.58;
+    for (let i=0;i<tips.length;i++) {
+      drawTextLine(ctx, tips[i], 12*s, '#888', GAME_W/2-tips[i].length*12*s*1.05/2, tipY0+i*24*s);
+    }
+
+    // Back button
+    const backY = GAME_H * 0.88;
+    const backSel = menuSel === 0;
+    if (backSel) {
+      ctx.fillStyle = '#FFF3E0';
+      ctx.fillRect(GAME_W/2-40*s, backY-4*s, 80*s, 26*s);
+    }
+    drawTextLine(ctx, '返回', 18*s, backSel?'#E65100':'#666', GAME_W/2-18*s*1.05, backY);
+
+  }
+}
+
+function renderLevelIntro(ctx) {
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0,0,GAME_W,GAME_H);
+  const s = SCALE;
+  const a = Math.min(1, introTimer > 1 ? (2-introTimer) : introTimer);
+
+  const numTxt = '第'+cnNum(currentLevel)+'幕';
+  ctx.globalAlpha = a;
+  const numSz = 24*s;
+  const numSpacing = numSz * 1.1;
+  const numTotalW = numTxt.length * numSpacing;
+  for (let i=0;i<numTxt.length;i++) {
+    atlas.draw(ctx, numTxt[i], numSz, '#333', GAME_W/2 - numTotalW/2 + i*numSpacing, GAME_H*0.35);
+  }
+  const nameSz = 28*s;
+  const nameSpacing = nameSz * 1.1;
+  const nameTotalW = currentLevelName.length * nameSpacing;
+  for (let i=0;i<currentLevelName.length;i++) {
+    atlas.draw(ctx, currentLevelName[i], nameSz, '#F44336', GAME_W/2 - nameTotalW/2 + i*nameSpacing, GAME_H*0.45);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function renderDeath(ctx) {
+  // Full dark background
+  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  ctx.fillRect(0,0,GAME_W,GAME_H);
+  const s = SCALE;
+
+  // Title: 败北
+  const txt = '败北';
+  const dSz = 36*s;
+  const dSpacing = dSz * 1.15;
+  const dTotalW = txt.length * dSpacing;
+  for (let i=0;i<txt.length;i++) {
+    atlas.draw(ctx,txt[i],dSz,'#F44336',GAME_W/2 - dTotalW/2 + i*dSpacing, GAME_H*0.18);
+  }
+
+  // Subtitle: current level name
+  const subTxt = '第'+cnNum(currentLevel)+'幕 — '+currentLevelName;
+  const subSz = 10*s;
+  ctx.font = subSz+'px sans-serif';
+  ctx.fillStyle = '#888';
+  ctx.textAlign = 'center';
+  ctx.fillText(subTxt, GAME_W/2, GAME_H*0.35);
+  ctx.textAlign = 'left';
+
+  // Two buttons
+  const btnW = 140*s, btnH = 38*s, btnGap = 14*s;
+  const btnY1 = GAME_H*0.44;
+  const btnY2 = btnY1 + btnH + btnGap;
+  const btnX = GAME_W/2 - btnW/2;
+
+  // Button 1: 继续游戏 (continue)
+  const sel1 = deathMenuSel === 0;
+  ctx.fillStyle = sel1 ? 'rgba(76,175,80,0.25)' : 'rgba(255,255,255,0.05)';
+  ctx.strokeStyle = sel1 ? '#4CAF50' : '#555';
+  ctx.lineWidth = sel1 ? 2 : 1;
+  ctx.beginPath(); ctx.roundRect(btnX, btnY1, btnW, btnH, 6); ctx.fill(); ctx.stroke();
+  // Button text centered with fillText for reliable positioning
+  const b1Sz = 15*s;
+  ctx.font = 'bold '+b1Sz+'px sans-serif';
+  ctx.fillStyle = sel1 ? '#4CAF50' : '#aaa';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('继续游戏', btnX + btnW/2, btnY1 + btnH/2);
+
+  // Hint below button 1
+  if (sel1) {
+    const hSz = 8*s;
+    ctx.font = hSz+'px sans-serif';
+    ctx.fillStyle = '#666';
+    ctx.fillText('从本幕重新开始', btnX + btnW/2, btnY1 + btnH + 10*s);
+  }
+
+  // Button 2: 返回首页 (back to title)
+  const sel2 = deathMenuSel === 1;
+  ctx.fillStyle = sel2 ? 'rgba(244,67,54,0.15)' : 'rgba(255,255,255,0.05)';
+  ctx.strokeStyle = sel2 ? '#F44336' : '#444';
+  ctx.lineWidth = sel2 ? 2 : 1;
+  ctx.beginPath(); ctx.roundRect(btnX, btnY2, btnW, btnH, 6); ctx.fill(); ctx.stroke();
+  const b2Sz = 13*s;
+  ctx.font = b2Sz+'px sans-serif';
+  ctx.fillStyle = sel2 ? '#F44336' : '#777';
+  ctx.fillText('返回首页', btnX + btnW/2, btnY2 + btnH/2);
+
+  // Hint below button 2
+  if (sel2) {
+    const hSz = 8*s;
+    ctx.font = hSz+'px sans-serif';
+    ctx.fillStyle = '#666';
+    ctx.fillText('丢失所有进度', btnX + btnW/2, btnY2 + btnH + 10*s);
+  }
+
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+
+  // Store button rects for click detection
+  deathBtn1 = {x:btnX, y:btnY1, w:btnW, h:btnH};
+  deathBtn2 = {x:btnX, y:btnY2, w:btnW, h:btnH};
+}
+
+function renderVictory(ctx) {
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0,0,GAME_W,GAME_H);
+  const s = SCALE;
+
+  // Title: 胜利
+  const txt = '胜利';
+  const tSz = 40*s;
+  const tSpacing = tSz * 1.2;
+  const tTotalW = txt.length * tSpacing;
+  const cols = ['#FFD600','#FF9800'];
+  for (let i=0;i<txt.length;i++) {
+    atlas.draw(ctx,txt[i],tSz,cols[i], GAME_W/2 - tTotalW/2 + i*tSpacing, GAME_H*0.08 + Math.sin(titleBlink*3+i)*6);
+  }
+
+  // Subtitle
+  const sub = '魔龙已灭 天下太平';
+  const subSz = 14*s;
+  const subSpacing = subSz * 1.3;
+  const subTotalW = sub.length * subSpacing;
+  for (let i=0;i<sub.length;i++) {
+    atlas.draw(ctx,sub[i],subSz,'#aaa', GAME_W/2 - subTotalW/2 + i*subSpacing, GAME_H*0.19);
+  }
+
+  // Kill stats title
+  const statTitle = '击杀统计';
+  const stSz = 14*s;
+  const stSpacing = stSz * 1.2;
+  const stTotalW = statTitle.length * stSpacing;
+  for (let i=0;i<statTitle.length;i++) {
+    atlas.draw(ctx,statTitle[i],stSz,'#FFD600', GAME_W/2 - stTotalW/2 + i*stSpacing, GAME_H*0.27);
+  }
+
+  // Divider
+  ctx.strokeStyle = '#444';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(GAME_W*0.15, GAME_H*0.31);
+  ctx.lineTo(GAME_W*0.85, GAME_H*0.31);
+  ctx.stroke();
+
+  // Kill stats list
+  const statTypes = Object.keys(killStats).filter(k => killStats[k] > 0);
+  const rowH = 22*s;
+  const startY = GAME_H*0.33;
+  const maxRows = Math.min(statTypes.length, Math.floor((GAME_H*0.78 - startY) / rowH));
+  let totalKills = 0;
+  for (const k in killStats) totalKills += killStats[k];
+
+  for (let r=0; r<maxRows; r++) {
+    const type = statTypes[r];
+    const kills = killStats[type];
+    const ry = startY + r * rowH;
+    const nameSz = 12*s;
+
+    // Monster name
+    const mInfo = MONSTER_INFO[type];
+    const displayName = mInfo ? mInfo[0] : type;
+    const nameCol = mInfo ? mInfo[1] : '#ccc';
+    for (let i=0;i<displayName.length;i++) {
+      atlas.draw(ctx, displayName[i], nameSz, nameCol, GAME_W*0.2 + i*nameSz*1.1, ry);
+    }
+
+    // Kill count
+    const killStr = 'x' + kills;
+    ctx.font = 'bold '+Math.round(12*s)+'px '+FONT_FAMILY;
+    ctx.fillStyle = '#FFD600';
+    ctx.textAlign = 'left';
+    ctx.fillText(killStr, GAME_W*0.65, ry + nameSz*0.85);
+  }
+
+  // Total
+  const totalY = startY + maxRows * rowH + 8*s;
+  ctx.strokeStyle = '#444';
+  ctx.beginPath();
+  ctx.moveTo(GAME_W*0.15, totalY - 4*s);
+  ctx.lineTo(GAME_W*0.85, totalY - 4*s);
+  ctx.stroke();
+
+  const totalLabel = '总计击杀';
+  const tlSz = 13*s;
+  for (let i=0;i<totalLabel.length;i++) {
+    atlas.draw(ctx,totalLabel[i],tlSz,'#aaa', GAME_W*0.2 + i*tlSz*1.1, totalY);
+  }
+  ctx.font = 'bold '+Math.round(14*s)+'px '+FONT_FAMILY;
+  ctx.fillStyle = '#FFD600';
+  ctx.textAlign = 'left';
+  ctx.fillText('x' + totalKills, GAME_W*0.65, totalY + tlSz*0.85);
+  ctx.textAlign = 'start';
+
+  // Replay button
+  if (Math.floor(titleBlink*2)%2===0) {
+    const r = '点击重玩';
+    const rSz = 16*s;
+    const rSpacing = rSz * 1.2;
+    const rTotalW = r.length * rSpacing;
+    for (let i=0;i<r.length;i++) {
+      atlas.draw(ctx,r[i],rSz,'#666', GAME_W/2 - rTotalW/2 + i*rSpacing, GAME_H*0.92);
+    }
+  }
+}
+
+// Click/tap handler for menus
+function getClickY(e) {
+  const rect = canvas.getBoundingClientRect();
+  const clientY = e.clientY !== undefined ? e.clientY : (e.touches?e.touches[0].clientY:0);
+  return (clientY - rect.top) / rect.height;
+}
+
+function getClickPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const cx = e.clientX !== undefined ? e.clientX : (e.touches?e.touches[0].clientX:0);
+  const cy = e.clientY !== undefined ? e.clientY : (e.touches?e.touches[0].clientY:0);
+  return { x: (cx - rect.left) / rect.width * GAME_W, y: (cy - rect.top) / rect.height * GAME_H };
+}
+function hitRect(pos, r) { return r && pos.x >= r.x && pos.x <= r.x+r.w && pos.y >= r.y && pos.y <= r.y+r.h; }
+
+function handleClickEvent(e) {
+  if (scene === 'title') {
+    handleTitleClick(getClickY(e));
+  } else if (scene === 'death') {
+    const pos = getClickPos(e);
+    if (hitRect(pos, deathBtn1)) { deathMenuSel = 0; handleMenuAction(); }
+    else if (hitRect(pos, deathBtn2)) { deathMenuSel = 1; handleMenuAction(); }
+  } else if (scene === 'victory') {
+    handleMenuAction();
+  }
+}
+
+canvas.addEventListener('click', handleClickEvent);
+canvas.addEventListener('touchstart', e => {
+  if (scene==='title'||scene==='death'||scene==='victory') {
+    e.preventDefault();
+    handleClickEvent(e);
+  }
+}, {passive:false});
+
+function handleTitleClick(yFrac) {
+  if (menuState === 'main') {
+    // Buttons at 0.55 with 46*s gap
+    const s = SCALE;
+    const btnY0 = 0.52;
+    const btnGap = 46*s / GAME_H;
+    const btnH = 36*s / GAME_H;
+    for (let i=0;i<2;i++) {
+      const top = btnY0 + i*btnGap - 0.01;
+      const bot = top + btnH;
+      if (yFrac >= top && yFrac <= bot) {
+        menuSel = i;
+        if (i===0) { resetPlayer(); storyChars.length=0; startLevel(0); }
+        else if (i===1) { menuState='controls'; menuSel=0; }
+        return;
+      }
+    }
+  } else if (menuState === 'controls') {
+    // Back button at ~0.85+
+    if (yFrac >= 0.85) {
+      menuState = 'main';
+      menuSel = 1;
+    }
+  }
+}
+
+function handleMenuAction() {
+  if (scene==='title') {
+    // Fallback: if clicking anywhere on title main, start game
+    if (menuState==='main') {
+      resetPlayer();
+      startLevel(0);
+    }
+  } else if (scene==='death') {
+    if (deathMenuSel === 0) {
+      // Continue game: restart current level, keep weapon
+      const savedWeapon = player.weapon;
+      const deathX = player.x;
+      const deathY = player.y;
+      // Determine which modifiers survive (50% each)
+      const droppedMods = [];
+      if (player.fireWeapon && Math.random() < 0.5) droppedMods.push('火');
+      if (player.poisonWeapon && Math.random() < 0.5) droppedMods.push('毒');
+      if (player.longWeapon && Math.random() < 0.5) droppedMods.push('长');
+      if (player.frostWeapon && Math.random() < 0.5) droppedMods.push('霜');
+
+      resetPlayer();
+      startLevel(currentLevel);
+
+      // Restore base weapon
+      if (savedWeapon) {
+        player.weapon = savedWeapon;
+        recalcStats();
+      }
+      // Spawn surviving modifiers at death position
+      for (let i = 0; i < droppedMods.length; i++) {
+        spawnItem(droppedMods[i], deathX + (i - 1) * 20, deathY);
+      }
+    } else {
+      // Back to title: lose all progress
+      resetPlayer();
+      storyChars.length = 0;
+      Object.keys(killStats).forEach(k => delete killStats[k]);
+      resetWeather();
+      scene = 'title';
+      menuState = 'main';
+      menuSel = 0;
+    }
+  } else if (scene==='victory') {
+    resetPlayer();
+    storyChars.length = 0;
+    Object.keys(killStats).forEach(k => delete killStats[k]);
+    resetWeather();
+    scene = 'title';
+    menuState = 'main';
+    menuSel = 0;
+  }
+}
+
+// =============================================================
+// SECTION 15: MAIN GAME LOOP
+// =============================================================
+let lastTime = 0;
+
+function gameLoop(ts) {
+  const dt = Math.min(0.05, (ts - lastTime)/1000);
+  lastTime = ts;
+
+  try {
+  updateKeyboardInput();
+  updateTouchInput();
+
+  switch(scene) {
+    case 'title':
+      updateTitle(dt);
+      break;
+    case 'gameplay':
+      if (levelNameTimer > 0) levelNameTimer -= dt;
+      if (levelTransitionCd > 0) levelTransitionCd -= dt;
+      playerUpdate(dt);
+      for (const m of monsters) {
+        try { updateMonster(m,dt); } catch(e) { m.dead=true; m.deathTimer=0; }
+      }
+      monsters = monsters.filter(m => !m.dead || m.deathTimer > 0);
+      updateProjectiles(dt);
+      // Lava drip system: '熔' tiles periodically drip lava projectiles downward
+      lavaDripTimer -= dt;
+      if (lavaDripTimer <= 0) {
+        lavaDripTimer = 1.8; // drip every 1.8 seconds
+        const viewL = Math.max(0, Math.floor((cam.x - 60) / TILE));
+        const viewR = Math.min(levelW - 1, Math.floor((cam.x + C.width + 60) / TILE));
+        const viewT = Math.max(0, Math.floor((cam.y - 60) / TILE));
+        const viewB = Math.min(levelH - 1, Math.floor((cam.y + C.height + 60) / TILE));
+        for (let gy = viewT; gy <= viewB; gy++) {
+          for (let gx = viewL; gx <= viewR; gx++) {
+            if (levelMap[gy] && levelMap[gy][gx] === '熔') {
+              // Drip lava downward from bottom of tile
+              const dx = gx * TILE + TILE / 2 + (Math.random() - 0.5) * 8;
+              const dy = gy * TILE + TILE;
+              spawnProjectile(dx, dy, (Math.random() - 0.5) * 15, 80 + Math.random() * 40, '岩', '#FF6D00', 1);
+              addParticle('滴', dx, dy, 0, 10, '#E65100', 10, 0.3);
+            }
+          }
+        }
+      }
+      updateItems(dt);
+      updateParticles(dt);
+      cam.follow(player.x+player.w/2, player.y+player.h/2, levelW*TILE, levelH*TILE, dt);
+      cam.update(dt);
+      messageTimer = Math.max(0, messageTimer-dt);
+      if (input.interact || input.attackPressed) checkInteract();
+      // Normal attack logic with plunge deferral
+      if (input.attackPressed && player.attackCooldown <= 0 && player.dashState === 'none' && player.plungeState === 'none') {
+        if (player.grounded || player.coyoteTime > 0) {
+          // On ground or near-ground: attack immediately
+          player.attackTimer = 0.2;
+          player.attackCooldown = 0.35;
+          doPlayerAttack();
+          player._airAtkPending = false;
+        } else {
+          // In air: defer to allow plunge detection
+          player._airAtkPending = true;
+        }
+      }
+      // Deferred air attack: fires when attack key released quickly (tap, not hold)
+      if (player._airAtkPending && !input.attack && player.plungeState === 'none' && player.dashState === 'none') {
+        if (player.attackCooldown <= 0) {
+          player.attackTimer = 0.2;
+          player.attackCooldown = 0.35;
+          doPlayerAttack();
+        }
+        player._airAtkPending = false;
+      }
+      // Clear pending if plunge triggered or landed
+      if (player.plungeState !== 'none') {
+        player._airAtkPending = false;
+      }
+      if (player.grounded && player._airAtkPending && player.attackCooldown <= 0) {
+        // Landed while pending: fire the attack
+        player.attackTimer = 0.2;
+        player.attackCooldown = 0.35;
+        doPlayerAttack();
+        player._airAtkPending = false;
+      }
+      autoInteractDoors();
+      // Burning/poison DoT (2 damage per tick)
+      for (const m of monsters) {
+        if (m.dead) continue;
+        if (m.burning > 0 && Math.random() < dt) { m.hp-=2; if(m.hp<=0){m.dead=true;m.deathTimer=0.5;if(!killStats[m.type])killStats[m.type]=0;killStats[m.type]++;} }
+        if (m.poisoned > 0 && Math.random() < dt*0.5) { m.hp-=2; if(m.hp<=0){m.dead=true;m.deathTimer=0.5;if(!killStats[m.type])killStats[m.type]=0;killStats[m.type]++;} }
+      }
+      if (player.dead) { titleBlink=0; deathMenuSel=0; deathBtn1=null; deathBtn2=null; scene='death'; }
+      // Level transitions
+      const hasBoss = monsters.some(m=>(m.type==='魔王'||m.type==='魔龙'||m.type==='火龙')&&!m.dead);
+      // Forward: reach right edge and press right
+      if (checkLevelExit()) {
+        if (!hasBoss) startLevel(currentLevel+1);
+      }
+      // Backward: at left edge and press left
+      if (checkLevelEntrance()) {
+        // Skip cutscene levels when going backward
+        let prevIdx = currentLevel - 1;
+        while (prevIdx >= 0 && LEVELS[prevIdx] && LEVELS[prevIdx].cutscene) {
+          prevIdx--;
+        }
+        if (prevIdx >= 0) startLevelFromEnd(prevIdx);
+      }
+      // Update weather
+      updateWeather(dt);
+      // Safety: clamp projectiles and particles
+      if (projectiles.length > 100) projectiles.length = 100;
+      if (particles.length > 350) particles.length = 300;
+      break;
+    case 'cutscene_fusion':
+      updateCutscene(dt);
+      updateParticles(dt);
+      break;
+  }
+  } catch(e) { /* prevent crash */ }
+
+  // Render
+  ctx.fillStyle = weatherState.bgColor || '#fff';
+  ctx.fillRect(0,0,GAME_W,GAME_H);
+
+  _renderPhase = true;
+  try {
+  switch(scene) {
+    case 'title':
+      renderTitle(ctx);
+      break;
+    case 'gameplay':
+      ctx.save();
+      ctx.scale(WORLD_SCALE, WORLD_SCALE);
+      renderTiles(ctx);
+      renderItems(ctx);
+      for (const m of monsters) {
+        try { renderMonster(ctx,m); } catch(e) { /* skip broken monster render */ }
+      }
+      renderPlayer(ctx);
+      renderProjectiles(ctx);
+      renderParticles(ctx);
+      ctx.restore();
+      renderDarkness(ctx);
+      renderWeatherOverlay(ctx);
+      renderHUD(ctx);
+      // Level name overlay (fades out over 3 seconds)
+      if (levelNameTimer > 0) {
+        const lnAlpha = Math.min(1, levelNameTimer / 0.5); // fade out in last 0.5s
+        const s = SCALE;
+        ctx.globalAlpha = lnAlpha * 0.9;
+        const lnTxt = '第' + cnNum(currentLevel) + '幕 ' + currentLevelName;
+        const lnSz = 14 * s;
+        // Dark background pill
+        const lnW = lnTxt.length * lnSz * 1.1 + 16 * s;
+        const lnH = lnSz + 12 * s;
+        const lnX = 6 * s;
+        const lnY = 56 * s;
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.beginPath(); ctx.roundRect(lnX, lnY, lnW, lnH, 4); ctx.fill();
+        // Text
+        for (let i = 0; i < lnTxt.length; i++) {
+          atlas.draw(ctx, lnTxt[i], lnSz, '#fff', lnX + 8 * s + i * lnSz * 1.1, lnY + 6 * s);
+        }
+        ctx.globalAlpha = 1;
+      }
+      renderTouchButtons(ctx);
+      break;
+    case 'cutscene_fusion':
+      renderCutscene(ctx);
+      break;
+    case 'death':
+      titleBlink += dt;
+      ctx.save();
+      ctx.scale(WORLD_SCALE, WORLD_SCALE);
+      renderTiles(ctx);
+      for (const m of monsters) {
+        try { renderMonster(ctx,m); } catch(e) {}
+      }
+      renderParticles(ctx);
+      ctx.restore();
+      renderDeath(ctx);
+      break;
+    case 'victory':
+      titleBlink += dt;
+      renderVictory(ctx);
+      break;
+  }
+  } catch(e) { /* prevent render crash */ }
+  _renderPhase = false;
+  flushPendingParticles();
+
+  requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+
+// Debug helper for testing
+window._dbg = {
+  get scene() { return scene; },
+  set scene(v) { scene = v; },
+  get player() { return player; },
+  get monsters() { return monsters; },
+  get levelW() { return levelW; },
+  get levelH() { return levelH; },
+  get killStats() { return killStats; },
+  get deathMenuSel() { return deathMenuSel; },
+  set deathMenuSel(v) { deathMenuSel = v; },
+  get titleBlink() { return titleBlink; },
+  set titleBlink(v) { titleBlink = v; },
+  get levelNameTimer() { return levelNameTimer; },
+  get TILE_DEF() { return TILE_DEF; },
+  resetPlayer() { resetPlayer(); },
+  startLevel(n) { currentLevel = n; startLevel(n); },
+  recalcStats() { recalcStats(); },
+  get levelName() { return currentLevelName; },
+};
+</script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"75124c326cb447fe934cde04713ae013","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"75124c326cb447fe934cde04713ae013","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"75124c326cb447fe934cde04713ae013","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"75124c326cb447fe934cde04713ae013","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"75124c326cb447fe934cde04713ae013","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"75124c326cb447fe934cde04713ae013","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"75124c326cb447fe934cde04713ae013","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
