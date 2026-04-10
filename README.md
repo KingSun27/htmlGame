@@ -2,7 +2,7 @@
 
 支持手机浏览器，电脑浏览器双端游玩。
 
-地址 https://kingsun27.github.io/htmlGame/game.html
+游玩地址 https://kingsun27.github.io/htmlGame/game.html
 
 文字占位符地图编辑
 
